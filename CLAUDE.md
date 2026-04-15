@@ -29,24 +29,45 @@ Un seul thread, un seul syscall par itération (`io_uring_enter`). Les SQEs prod
 ### user_data packée sur 64 bits
 
 ```
-[ 32 bits : op_idx ][ 16 bits : generation ][ 16 bits : task_idx ]
+[ 32 bits : task_idx ][ 16 bits : syscall_nb ][ 16 bits : libre ]
 ```
 
-Deux sentinelles réservées en haut de l'espace :
+Sentinelles réservées en haut de l'espace (jamais produites par un packing légitime) :
 
 ```rust
 const TIMEOUT_UDATA: u64 = u64::MAX;
 const CANCEL_UDATA:  u64 = u64::MAX - 1;
-const WAKER_UDATA:   u64 = u64::MAX - 2;
+const WAKER_UDATA:   u64 = u64::MAX - 2;  // réservé
 ```
 
-### Task
+### Tag — interface runtime / future
 
-Une seule alloc : header + future inline. Type erasure à la création via deux `fn` bruts (`poll_fn<F>`, `drop_fn<F>`). `rc: u16` compte les SQEs en vol — le slot n'est libéré que quand `rc == 0`. Stocké dans un `HiSlab<Option<NonNull<Task>>>` (niche `NonNull` → pas de discriminant).
+```rust
+pub struct Tag { task_idx: u32, syscall_nb: u16 }  // champs privés
 
-### Op slots
+impl Tag {
+    pub fn submit_sqe(&self, sqe: SqeRef<'_>);  // seule API exposée aux futures
+}
+```
 
-`OpSlot { result: Option<i32>, task_idx: u16, generation: u16 }`. La `generation` est incrémentée à chaque réutilisation du slot : toute CQE avec une génération obsolète est ignorée sans flag zombie.
+La future obtient son `Tag` depuis `CURRENT_TASK` au premier poll, appelle
+`tag.submit_sqe(sqe)` pour chaque SQE, et stocke le tag. Au poll suivant
+elle lit `CURRENT_TASK.result` — le runtime garantit qu'elle n'est pollée
+que si son `syscall_nb` correspond.
+
+### Task (RawTask)
+
+Une seule alloc : header + future inline. Layout :
+
+```
+[ fn_poll: *const () ][ fn_drop: *const () ][ alloc_size: u32 ][ rc: u16 ][ syscall_nb: u16 ][ future... ]
+```
+
+Type erasure à la création via `poll_fn<F>` et `drop_fn<F>`. `fn_poll` et
+`fn_drop` ne sont jamais nuls — la détection de stale passe par `syscall_nb`.
+`rc` démarre à 1 (token spawn) ; chaque SQE soumis l'incrémente ; chaque
+poll le décrémente après exécution. Libéré quand `rc == 0`. Stocké dans
+`HiSlab<Option<NonNull<RawTask>>>` (niche `NonNull` → pas de discriminant).
 
 ### Connexions — kernel-owned fds
 
@@ -91,5 +112,5 @@ hislab = { path = "../../hislab" }
 - **Aucune allocation sur le chemin chaud** : pas de `Vec::push` / `Box::new` hors init.
 - **Aucun `Arc` / `Mutex`** : tout est single-thread ; utiliser `Rc<RefCell<>>` ou accès direct.
 - **Aucun `unsafe` gratuit** : chaque bloc `unsafe` doit avoir un commentaire de justification `// SAFETY:`.
-- Les CQEs avec génération obsolète sont silencieusement ignorées — ne pas `panic!` sur un CQE inattendu.
-- `IORING_OP_ASYNC_CANCEL` émet un SQE supplémentaire ; après cancel, incrémenter la génération du slot immédiatement (avant la CQE d'annulation).
+- Les CQEs stale (`syscall_nb` != `task.syscall_nb`) sont silencieusement ignorées — pas de poll, mais `rc -= 1` quand même.
+- `rc` est décrémenté **après** le poll, jamais avant — décrémentation avant poll peut libérer une task encore vivante.
