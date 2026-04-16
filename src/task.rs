@@ -1,10 +1,18 @@
 use std::{
     alloc::{Layout, alloc, dealloc},
+    cell::UnsafeCell,
     future::Future,
     mem::{align_of, size_of},
+    ops::Add,
     pin::Pin,
     ptr::{NonNull, drop_in_place},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
+};
+
+use crate::{
+    buf_pool::WBuffer,
+    runtime::{GLOBAL_RUNTIME, RUNTIME_FREE_LIST},
+    task_slab::SlabIdx,
 };
 
 type PollFn = unsafe fn(*mut u8, &mut Context<'_>) -> Poll<()>;
@@ -22,13 +30,15 @@ type DropFn = unsafe fn(*mut u8);
 /// offset 24 : [F inline, implicite]               ─┘
 /// sizeof = 24 B
 /// ```
-#[repr(C)]
+#[repr(C, align(32))]
+
 struct RawTask {
-    poll_fn: Option<PollFn>,
+    poll_fn: PollFn,
     drop_fn: DropFn,
     alloc_size: u32,
-    ref_counter: u16,
-    _pad: [u64; 0],
+    ref_counter: UnsafeCell<u16>,
+    syscall_nb: UnsafeCell<u16>,
+    slab_idx: Option<SlabIdx>,
 }
 
 /// Handle vers une task allouée inline (`[RawTask | F]`).
@@ -38,6 +48,13 @@ struct RawTask {
 /// - `!Send + !Sync` par construction (ptr non-atomique, single-thread uniquement).
 pub(crate) struct Task {
     ptr: NonNull<RawTask>,
+}
+
+pub(crate) enum SyscallNbCompResult {
+    Expired,
+    Normal,
+    Multiple,
+    Error,
 }
 
 impl Task {
@@ -81,16 +98,56 @@ impl Task {
         // SAFETY: raw est valide pour l'écriture de RawTask.
         unsafe {
             (raw as *mut RawTask).write(RawTask {
-                poll_fn: Some(poll_fn::<F>),
+                poll_fn: poll_fn::<F>,
                 drop_fn: drop_fn::<F>,
                 alloc_size: alloc_size as u32,
-                ref_counter: 1,
-                _pad: [],
+                ref_counter: UnsafeCell::new(1),
+                syscall_nb: UnsafeCell::new(0),
+                slab_idx: None,
             });
         }
 
         Task {
             ptr: unsafe { NonNull::new_unchecked(raw as *mut RawTask) },
+        }
+    }
+    pub(crate) fn get_syscall_nb(&self) -> u16 {
+        unsafe { *(*self.ptr.as_ptr()).syscall_nb.get() }
+    }
+    pub(crate) fn evaluate_syscall_nb(&self, incoming: u16) -> SyscallNbCompResult {
+        const MULTIPLE_MASK: u16 = 0x8000;
+        let stored = self.get_syscall_nb();
+        let stored_rank = stored & !MULTIPLE_MASK;
+        let incoming_rank = incoming & !MULTIPLE_MASK;
+        if incoming_rank < stored_rank {
+            return SyscallNbCompResult::Expired;
+        }
+        if incoming_rank > stored_rank {
+            return SyscallNbCompResult::Error;
+        }
+        let stored_multiple = stored & MULTIPLE_MASK;
+        let incoming_multiple = incoming & MULTIPLE_MASK;
+        if stored_multiple != incoming_multiple {
+            return SyscallNbCompResult::Error;
+        }
+        if stored_multiple != 0 {
+            return SyscallNbCompResult::Multiple;
+        } else {
+            return SyscallNbCompResult::Normal;
+        }
+    }
+    pub(crate) fn augmente_syscall_nb(&mut self) {
+        unsafe {
+            let nb_syscall = self.ptr.as_mut().syscall_nb.get_mut();
+            *nb_syscall = *nb_syscall + 1;
+        }
+    }
+
+    /// Pose MULTIPLE_MASK sur syscall_nb — appelé quand un SQE multishot est soumis.
+    pub(crate) fn set_multishot(&mut self) {
+        unsafe {
+            let nb = self.ptr.as_mut().syscall_nb.get_mut();
+            *nb |= 0x8000;
         }
     }
 
@@ -106,7 +163,10 @@ impl Task {
     #[inline]
     pub(crate) fn inc_rc(&self) {
         // SAFETY: single-thread, pas d'accès concurrent.
-        unsafe { (*self.ptr.as_ptr()).ref_counter += 1 };
+        unsafe {
+            let rc = (*self.ptr.as_ptr()).ref_counter.get_mut();
+            *rc = *rc + 1;
+        };
     }
 
     /// Consomme le handle sans décrémenter `ref_counter`.
@@ -138,31 +198,42 @@ impl Task {
     /// # Safety
     /// Appelé depuis le thread runtime uniquement.
     #[inline]
-    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    pub(crate) fn poll(&mut self) -> Poll<()> {
+        let mut cx = Context::from_waker(Waker::noop());
         let raw = unsafe { self.ptr.as_mut() };
-        let Some(f) = raw.poll_fn else {
-            return Poll::Ready(());
-        };
-        let result = unsafe { f(self.data_ptr(), cx) };
-        if result.is_ready() {
-            raw.poll_fn = None;
-        }
+
+        let result = unsafe { (raw.poll_fn)(self.data_ptr(), &mut cx) };
+
         result
     }
-    pub(crate) unsafe fn free(&mut self) {
+    pub(crate) fn release(&mut self) {
         let raw = unsafe { self.ptr.as_mut() };
-        raw.ref_counter -= 1;
-        if raw.ref_counter == 0 {
-            // Future non consommée (teardown / abandon) : drop propre avant dealloc.
-            if raw.poll_fn.is_some() {
-                unsafe { (raw.drop_fn)(self.data_ptr()) };
-            }
+        let counter = raw.ref_counter.get_mut();
+        *counter = *counter - 1;
+
+        if *counter == 0 {
+            // Drop the futur first
+            unsafe { (raw.drop_fn)(self.data_ptr()) };
+            let idx = raw.slab_idx;
             let layout = unsafe {
                 // SAFETY: alignement toujours align_of::<RawTask>(), jamais modifié après alloc.
                 Layout::from_size_align_unchecked(raw.alloc_size as usize, align_of::<RawTask>())
             };
             // SAFETY: ptr provient de `alloc(layout)`, ref_counter == 0 → libération unique.
             unsafe { dealloc(self.ptr.as_ptr() as *mut u8, layout) };
+
+            //Once the task is totaly Drop we remove it from the slab in the runtime
+            if let Some(task_idx) = idx {
+                RUNTIME_FREE_LIST.with_borrow_mut(|l| l.push(task_idx))
+            }
+        }
+    }
+    fn get_rc(&self) -> u16 {
+        unsafe { *self.ptr.as_ref().ref_counter.get() }
+    }
+    pub(crate) fn set_task_idx(&mut self, slab_idx: SlabIdx) {
+        unsafe {
+            self.ptr.as_mut().slab_idx = Some(slab_idx);
         }
     }
 }
@@ -172,7 +243,9 @@ impl Clone for Task {
     #[inline]
     fn clone(&self) -> Self {
         // SAFETY: single-thread, ref_counter ne peut pas déborder (u16 max = 65535 tasks en vol).
-        unsafe { (*self.ptr.as_ptr()).ref_counter += 1 };
+
+        self.inc_rc();
+
         Task { ptr: self.ptr }
     }
 }
@@ -180,9 +253,7 @@ impl Clone for Task {
 impl Drop for Task {
     #[inline]
     fn drop(&mut self) {
-        unsafe {
-            self.free();
-        }
+        self.release();
     }
 }
 
@@ -216,7 +287,7 @@ mod tests {
 
     #[test]
     fn layout() {
-        assert_eq!(size_of::<RawTask>(), 24);
+        assert_eq!(size_of::<RawTask>(), 32);
         assert_eq!(size_of::<Task>(), size_of::<usize>()); // thin ptr = 8 B
         assert_eq!(size_of::<Option<Task>>(), size_of::<usize>()); // niche NonNull
     }
@@ -224,24 +295,22 @@ mod tests {
     #[test]
     fn ready_future() {
         let mut t = Task::new(async {});
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(t.poll(&mut cx).is_ready());
+        assert!(t.poll().is_ready());
         // ref_counter toujours 1 : seul handle, pas de SQEs
-        assert_eq!(unsafe { t.ptr.as_ref().ref_counter }, 1);
+        assert_eq!(unsafe { *t.ptr.as_ref().ref_counter.get() }, 1);
         // drop implicite ici → dealloc
     }
 
     #[test]
     fn clone_bump_et_drop_dec() {
         let t1 = Task::new(async {});
-        assert_eq!(unsafe { t1.ptr.as_ref().ref_counter }, 1);
+        assert_eq!(t1.get_rc(), 1);
 
         let t2 = t1.clone();
-        assert_eq!(unsafe { t1.ptr.as_ref().ref_counter }, 2);
+        assert_eq!(t1.get_rc(), 2);
 
         drop(t2);
-        assert_eq!(unsafe { t1.ptr.as_ref().ref_counter }, 1);
+        assert_eq!(t1.get_rc(), 1);
         // drop(t1) → ref_counter = 0 → dealloc
     }
 
@@ -273,15 +342,15 @@ mod tests {
     #[test]
     fn into_raw_from_raw_preserves_rc() {
         let t = Task::new(async {});
-        assert_eq!(unsafe { t.ptr.as_ref().ref_counter }, 1);
+        assert_eq!(t.get_rc(), 1);
 
         let raw = t.into_raw();
         // ref_counter inchangé (transfert de propriété, pas de décrément)
         let raw_task = unsafe { raw.cast::<RawTask>().as_ref() };
-        assert_eq!(raw_task.ref_counter, 1);
+        assert_eq!(unsafe { *raw_task.ref_counter.get() }, 1);
 
         let t2 = unsafe { Task::from_raw(raw) };
-        assert_eq!(unsafe { t2.ptr.as_ref().ref_counter }, 1);
+        assert_eq!(t2.get_rc(), 1);
         // drop(t2) → dealloc
     }
 }

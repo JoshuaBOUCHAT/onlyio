@@ -66,6 +66,8 @@ impl Drop for SlabSlot {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
+#[repr(transparent)]
 pub(crate) struct SlabIdx(u32);
 
 /// Slab de Tasks avec free list intrusive.
@@ -77,6 +79,7 @@ pub(crate) struct Slab {
     /// Index du prochain slot libre. `head == len` → slab plein.
     head: u32,
     len: u32,
+    task_count: u32,
 }
 
 impl Slab {
@@ -103,18 +106,21 @@ impl Slab {
             ptr,
             head: 0,
             len: cap,
+            task_count: 0,
         }
     }
 
     /// Insère une task et retourne son index.
-    pub(crate) fn insert(&mut self, task: Task) -> SlabIdx {
+    pub(crate) fn insert(&mut self, mut task: Task) -> SlabIdx {
         if self.head == self.len {
             self.growth();
         }
         let slot = unsafe { self.ptr.add(self.head as usize).as_mut() };
         let idx = SlabIdx(self.head);
+        task.set_task_idx(idx);
         self.head = slot.next_free(); // avance la free list avant d'écraser le slot
         unsafe { std::ptr::write(slot, SlabSlot::from(task)) };
+        self.task_count += 1;
         idx
     }
 
@@ -139,6 +145,7 @@ impl Slab {
         unsafe { std::ptr::write(slot, free_slot(self.head)) };
         // Remet l'index libéré en tête de free list.
         self.head = i;
+        self.task_count -= 1;
         task
     }
 
@@ -175,6 +182,9 @@ impl Slab {
 
     fn layout_for(len: u32) -> Layout {
         Layout::from_size_align(len as usize * size_of::<SlabSlot>(), 64).unwrap()
+    }
+    pub(crate) fn count(&self) -> u32 {
+        self.task_count
     }
 }
 
@@ -215,7 +225,6 @@ impl IndexMut<SlabIdx> for Slab {
 #[cfg(test)]
 mod test {
     use std::num::NonZeroU32;
-    use std::task::{Context, Waker};
 
     use crate::{task::Task, task_slab::Slab};
 
@@ -226,9 +235,8 @@ mod test {
         let idx = slab.insert(task);
         assert_eq!(idx.0, 0);
         let mut task = slab.remove(idx);
-        let waker = Waker::noop();
-        let mut context = Context::from_waker(waker);
-        assert!(task.poll(&mut context).is_ready());
+
+        assert!(task.poll().is_ready());
     }
 
     #[test]

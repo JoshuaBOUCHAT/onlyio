@@ -7,7 +7,7 @@ use std::{
 
 use io_uring::{opcode, squeue, types};
 
-use crate::sqe_queue;
+use crate::runtime::sqe_queue_push;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -87,6 +87,14 @@ impl<const N: usize> BufPool<N> {
             write_free: (read_count..read_count + write_count).collect(),
             write_rc: vec![0u32; write_count as usize].into_boxed_slice(),
         }
+    }
+
+    /// Pointeur vers le buffer write d'index absolu `buf_id` (0..write_count dans register_buffers).
+    #[inline]
+    pub fn write_buf_ptr(&self, buf_id: u16) -> *const u8 {
+        let abs = self.read_count as usize + buf_id as usize;
+        // SAFETY: abs < total garanti par l'appelant (buf_id < write_count).
+        unsafe { self.base.add(abs * Self::BUF_SIZE) }
     }
 
     /// Table d'`iovec` couvrant TOUS les slots (read + write) pour
@@ -233,8 +241,8 @@ impl<const N: usize> RwBuffer<N> {
         .build()
         .user_data(self.read_user_data);
 
-        sqe_queue::push(write);
-        sqe_queue::push(read);
+        sqe_queue_push(write);
+        sqe_queue_push(read);
         // Drop run avec committed=true → no-op.
     }
 }
@@ -254,7 +262,7 @@ impl<const N: usize> Drop for RwBuffer<N> {
         .build()
         .user_data(self.read_user_data);
 
-        sqe_queue::push(read);
+        sqe_queue_push(read);
     }
 }
 
@@ -304,7 +312,7 @@ impl<const N: usize> WBuffer<N> {
                 .build()
                 .user_data(wbuf_write_udata(self.abs_idx));
 
-        sqe_queue::push(write);
+        sqe_queue_push(write);
         mem::forget(self); // skip Drop — rc décrémenté par on_write_cqe()
     }
 }
