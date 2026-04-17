@@ -7,7 +7,7 @@ use std::{
 
 const PAGE_SIZE: usize = 4096;
 
-use io_uring::{IoUring, SubmissionQueue, squeue::Entry};
+use io_uring::{IoUring, squeue::Entry};
 
 use crate::{
     IOResult,
@@ -125,16 +125,13 @@ impl Runtime {
     fn sqe_queue_push(&mut self, entry: Entry) {
         self.pending.push(entry);
     }
-    fn handle_completion(&mut self) {}
+
     /// Insère la future dans le slab et retourne son index — sans la poller.
     fn register_future(&mut self, future: impl Future<Output = ()>) -> SlabIdx {
         let task = Task::new(future);
         self.tasks.insert(task)
     }
 
-    pub(crate) fn remove_task(&mut self, task_idx: SlabIdx) {
-        self.tasks.remove(task_idx);
-    }
     pub(crate) fn block_on(future: impl Future<Output = ()>) -> IOResult<()> {
         // Insertion dans le slab — borrow libéré immédiatement après.
         let task_idx = GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().register_future(future));
@@ -144,14 +141,26 @@ impl Runtime {
             let mut task = GLOBAL_RUNTIME.with_borrow(|rt| rt.tasks[task_idx].clone());
             CURRENT_TASK.set(Some(TaskInfo::initial_poll(task_idx)));
             let _ = task.poll();
+            println!("Test RC: {}", task.get_rc());
             task.release();
+            println!("Test RC after release: {}", task.get_rc());
         }
+        println!(
+            "slab_count: {}",
+            GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.tasks.count())
+        );
+        println!("Droped");
+        println!(
+            "free list_size: {}",
+            RUNTIME_FREE_LIST.with_borrow(|l| l.len())
+        );
         free_unsed_slab_slot();
 
         loop {
             // poll ready tasks
             let maybe_submit = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
                 if !rt.pending.is_empty() {
+                    println!("Submit {} sqe", rt.pending.len());
                     Some(rt.submit_and_wait())
                 } else {
                     None
@@ -165,12 +174,32 @@ impl Runtime {
             let entries: Vec<_> =
                 GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().ring.completion().collect()); //Collect the entries outside the borow
             // to allow to borow GLOBAL_RUNTIME inside entry handling
+            println!("Recieve {} CQE", entries.len());
+            if entries.len() == 0 {
+                panic!("Entries len ==0 runtime shouldnt been wakeup");
+            }
 
             for entry in entries {
+                // CQEs internes (WBuffer writes, etc.) — pas de task à réveiller.
+                /*if crate::buf_pool::is_internal_cqe(entry.user_data()) {
+                    continue;
+                }*/
+
+                // IORING_CQE_F_MORE : le kernel a encore des CQEs à envoyer pour ce SQE
+                // (multishot kernel : accept_multishot, recv_multishot…).
+                // Si set → ne pas appeler release() — le rc a été incrémenté une seule fois
+                // pour ce SQE et doit survivre jusqu'à la CQE finale.
+
+                let is_buffer = io_uring::cqueue::buffer_more(entry.flags());
+                let is_multishoot = io_uring::cqueue::more(entry.flags());
+                if is_more {
+                    println!("Recieve a is more");
+                }
+
                 let task_info = TaskInfo::from_entry(&entry);
                 let nb_syscall = task_info.tag.syscall_nb;
                 let task_idx = task_info.tag.task_idx;
-                let mut task = GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.tasks[task_idx].clone()); //Cheap clone
+                let mut task = GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.tasks[task_idx].clone());
 
                 match task.evaluate_syscall_nb(nb_syscall) {
                     SyscallNbCompResult::Error => {
@@ -179,19 +208,23 @@ impl Runtime {
                     SyscallNbCompResult::Expired => {}
                     SyscallNbCompResult::Normal => {
                         let mut task_info = task_info;
-                        task_info.tag.syscall_nb += 1; // We increment the tag has it may be use to produce next SQE
-                        task.augmente_syscall_nb(); //This allow to make all new incoming CQE with previous syscall_nb expired
+                        task_info.tag.syscall_nb += 1;
+                        task.augmente_syscall_nb();
                         CURRENT_TASK.set(Some(task_info));
                         let _ = task.poll();
                     }
                     SyscallNbCompResult::Multiple => {
-                        //As it is multiple we poll every time, the futur have to handle the logic
+                        println!("Recieve a multiple");
+                        // Batch SQEs ou multishot kernel : toujours poller.
+                        // Release uniquement sur la CQE finale (pas de F_MORE).
                         CURRENT_TASK.set(Some(task_info));
                         let _ = task.poll();
                     }
                 }
-
-                task.release();
+                //Should always release the task expect in is_more mode
+                if !is_more {
+                    task.release();
+                }
             }
             free_unsed_slab_slot(); //Use the free list to clear finished task (use this mekanism of extern free list because of the cross borowing problem)
 
@@ -235,23 +268,19 @@ impl Runtime {
         self.pending.push(sqe);
     }
 
-    /// ACCEPT_MULTISHOT + ACCEPT_DIRECT : un seul SQE pour toutes les connexions entrantes.
-    /// Chaque CQE donne un fixed_file_index. `listen_fd` est le fd du socket en écoute (non-fixed).
+    /// ACCEPT_DIRECT single-shot : une connexion entrante → un fixed_file_index.
+    /// `listen_fd` est le fd du socket en écoute (non-fixed).
     fn send_accept(&mut self, listen_fd: i32) {
-        let udata = self.current_udata(true); // multishot → MULTIPLE_MASK
-        // Synchronise le syscall_nb stocké dans la task avec le MULTIPLE_MASK du SQE,
-        // sinon evaluate_syscall_nb voit un mismatch et retourne Error.
+        let udata = self.current_udata(false);
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
-        self.tasks[task_idx].set_multishot();
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Accept::new(
             io_uring::types::Fd(listen_fd),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
-        .file_index(Some(io_uring::types::DestinationSlot::auto_target())) // ACCEPT_DIRECT, slot auto
+        .file_index(Some(io_uring::types::DestinationSlot::auto_target()))
         .build()
-        .flags(io_uring::squeue::Flags::ASYNC)
         .user_data(udata);
         self.pending.push(sqe);
     }
@@ -267,6 +296,70 @@ impl Runtime {
                 .build()
                 .user_data(udata);
         self.pending.push(sqe);
+    }
+
+    /// RECV_MULTISHOT : un seul SQE, N CQEs via IORING_CQE_F_MORE.
+    /// MULTIPLE_MASK posé → la task est repollée sur chaque CQE.
+    fn send_recv_multishot(&mut self, fd: u32) {
+        let udata = self.current_udata(true); // MULTIPLE_MASK
+        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        self.tasks[task_idx].set_multishot();
+        self.tasks[task_idx].inc_rc();
+        let sqe = io_uring::opcode::RecvMulti::new(io_uring::types::Fixed(fd), 0)
+            .build()
+            .user_data(udata);
+        self.pending.push(sqe);
+    }
+
+    /// ACCEPT_MULTISHOT + ACCEPT_DIRECT : un seul SQE accepte toutes les connexions entrantes.
+    /// Chaque CQE donne un fixed_file_index. MULTIPLE_MASK posé → task repollée à chaque CQE.
+    fn send_accept_multishot(&mut self, listen_fd: i32) {
+        let udata = self.current_udata(true); // MULTIPLE_MASK
+        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        self.tasks[task_idx].set_multishot();
+        self.tasks[task_idx].inc_rc();
+        let sqe = io_uring::opcode::AcceptMulti::new(io_uring::types::Fd(listen_fd))
+            .allocate_file_index(true)
+            .build()
+            .user_data(udata);
+        self.pending.push(sqe);
+    }
+
+    /// WriteFixed pour `commit()` : soumet le write, réveille la task via la CQE.
+    /// Pas de replenish read — le buf_ring est libéré en userspace après la CQE.
+    fn send_commit_write(&mut self, ptr: *const u8, fd_idx: u32, len: u32, buf_id: u16) {
+        let udata = self.current_udata(false);
+        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        self.tasks[task_idx].inc_rc();
+        let sqe =
+            io_uring::opcode::WriteFixed::new(io_uring::types::Fixed(fd_idx), ptr, len, buf_id)
+                .build()
+                .user_data(udata);
+        self.pending.push(sqe);
+    }
+
+    /// Rend le slot `buf_idx` au buf_ring (groupe 0) sans syscall.
+    ///
+    /// Écrit l'entrée à la position `tail & mask`, puis avance le tail.
+    /// Un fence Release garantit que l'entrée est visible du kernel avant le tail.
+    fn release_buf_to_ring(&self, buf_idx: u32) {
+        let ring_entries = self.buffer.read_count as usize;
+        // SAFETY: ring_entries doit être une puissance de 2 — garanti à la construction.
+        let mask = ring_entries - 1;
+
+        let tail_ptr = unsafe { self.buf_ring.add(14) as *mut u16 };
+        let tail = unsafe { tail_ptr.read() } as usize;
+        let slot = (tail & mask) * 16;
+
+        let addr = self.buffer.read_buf_addr(buf_idx) as u64;
+        unsafe {
+            (self.buf_ring.add(slot) as *mut u64).write(addr);
+            (self.buf_ring.add(slot + 8) as *mut u32).write(BufPool::<1>::BUF_SIZE as u32);
+            (self.buf_ring.add(slot + 12) as *mut u16).write(buf_idx as u16);
+            // Fence : l'entrée doit être visible avant que le kernel lise le nouveau tail.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            tail_ptr.write((tail + 1) as u16);
+        }
     }
 
     /// CONNECT : connecte `fd` (fixed file) à `addr`.
@@ -302,7 +395,9 @@ fn free_unsed_slab_slot() {
     GLOBAL_RUNTIME.with_borrow_mut(|rt| {
         RUNTIME_FREE_LIST.with_borrow_mut(|f_list| {
             for &idx in f_list.iter() {
-                let _ = rt.tasks.remove(idx);
+                println!("Remove {:?}", idx);
+                let _ = rt.tasks.remove_dropped_task(idx);
+                println!("task size:{}", rt.tasks.count());
             }
             f_list.clear();
         })
@@ -328,6 +423,18 @@ pub(crate) fn submit_accept(listen_fd: i32) {
 }
 pub(crate) fn submit_write(fd: u32, buf_id: u16, len: u32) {
     GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().send_write(fd, buf_id, len));
+}
+pub(crate) fn submit_recv_multishot(fd: u32) {
+    GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().send_recv_multishot(fd));
+}
+pub(crate) fn submit_accept_multishot(listen_fd: i32) {
+    GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().send_accept_multishot(listen_fd));
+}
+pub(crate) fn submit_commit_write(ptr: *const u8, fd_idx: u32, len: u32, buf_id: u16) {
+    GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().send_commit_write(ptr, fd_idx, len, buf_id));
+}
+pub(crate) fn release_read_buf(buf_idx: u32) {
+    GLOBAL_RUNTIME.with_borrow(|rt| rt.release_buf_to_ring(buf_idx));
 }
 pub(crate) fn submit_connect(fd: u32, addr: *const libc::sockaddr, addrlen: libc::socklen_t) {
     GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().send_connect(fd, addr, addrlen));

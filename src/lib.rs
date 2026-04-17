@@ -1,5 +1,6 @@
 pub mod buf_pool;
 pub mod runtime;
+pub mod stream;
 
 pub(crate) mod task;
 pub(crate) mod task_slab;
@@ -10,6 +11,8 @@ use buf_pool::{RwBuffer, WBuffer};
 use runtime::GLOBAL_RUNTIME;
 
 use crate::runtime::Runtime;
+pub use calls::accept::accept_stream;
+pub use calls::read::read_stream;
 
 //Pour l'instant la fonction est blocking et retourn rien
 pub fn block_on(future: impl Future<Output = ()>) -> IOResult<()> {
@@ -28,7 +31,8 @@ mod test {
 
     use crate::{
         block_on,
-        calls::{accept::accept, read::read},
+        calls::{accept::accept_stream, read::read_stream},
+        stream::StreamExt,
     };
 
     #[test]
@@ -51,31 +55,27 @@ mod test {
         let client = thread::spawn(|| {
             thread::sleep(Duration::from_millis(50));
             let mut s = TcpStream::connect("127.0.0.1:6379").unwrap();
-            println!("Client conn open");
             s.write_all(b"ping").unwrap();
-            println!("Client send mesage");
             let mut buf = [0u8; 8];
             s.read_exact(&mut buf).unwrap();
-            println!("Client recieve message back");
             assert_eq!(&buf, b"pingping");
         });
-        println!("starting the server");
+
         block_on(async move {
-            // Accepte la première connexion (multishot — one-shot ici)
-            let conn_fd = accept(listen_fd).await;
-            println!("Now accepting");
+            println!("Sending multishot accept");
+            let mut conns = accept_stream(listen_fd);
+            println!("Accepted");
+            let conn_fd = conns.next().await.unwrap();
+            println!("Recieve conn");
 
-            // Lit le message entrant (BUFFER_SELECT, kernel choisit le buffer)
-            let mut rwbuf = read(conn_fd).await;
-            println!("Read");
+            let mut reads = read_stream(conn_fd);
+            let mut rwbuf = reads.next().await.unwrap();
+            println!("recieve read");
             let len = rwbuf.bytes as usize;
-
             // Double le contenu en place : [0..len] → [0..len] + [len..2*len]
             rwbuf.write_slice().copy_within(0..len, len);
-            println!("Commiting");
-
-            // Envoie les 2*len octets et re-queue un read sur la connexion
-            rwbuf.commit((2 * len) as u32);
+            // Envoie les 2*len octets, attend la CQE, libère le slot buf_ring
+            rwbuf.commit((2 * len) as u32).await;
             println!("Commited");
         })
         .unwrap();

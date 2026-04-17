@@ -66,7 +66,7 @@ impl Drop for SlabSlot {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 pub(crate) struct SlabIdx(u32);
 
@@ -128,7 +128,9 @@ impl Slab {
     ///
     /// # Panics
     /// Si l'index est hors bornes ou ne pointe pas sur une Task.
-    pub(crate) fn remove(&mut self, idx: SlabIdx) -> Task {
+    /// Safety Le mecanism de drop des task fait que des task dropped
+    /// peuvent exister dans la slab retoruner ça valeur si return un dropped task -> U.B
+    pub(crate) unsafe fn remove(&mut self, idx: SlabIdx) -> Task {
         let i = idx.0;
         assert!(
             (i as usize) < self.len as usize,
@@ -147,6 +149,22 @@ impl Slab {
         self.head = i;
         self.task_count -= 1;
         task
+    }
+    pub(crate) fn remove_dropped_task(&mut self, idx: SlabIdx) {
+        let i = idx.0;
+        assert!(
+            (i as usize) < self.len as usize,
+            "remove out of bounds : index={}, len={}",
+            i,
+            self.len
+        );
+        let slot = unsafe { self.ptr.add(i as usize).as_mut() };
+        assert!(slot.is_task(), "remove sur un slot libre (index={})", i);
+
+        unsafe { std::ptr::write(slot, free_slot(self.head)) };
+        // Remet l'index libéré en tête de free list.
+        self.head = i;
+        self.task_count -= 1;
     }
 
     fn growth(&mut self) {
@@ -234,7 +252,7 @@ mod test {
         let task = Task::new(async { eprintln!("hey") });
         let idx = slab.insert(task);
         assert_eq!(idx.0, 0);
-        let mut task = slab.remove(idx);
+        let mut task = unsafe { slab.remove(idx) };
 
         assert!(task.poll().is_ready());
     }
@@ -247,7 +265,7 @@ mod test {
         assert_eq!(i0.0, 0);
         assert_eq!(i1.0, 1);
 
-        slab.remove(i0); // libère slot 0
+        unsafe { slab.remove(i0) }; // libère slot 0
         let i2 = slab.insert(Task::new(async {}));
         assert_eq!(i2.0, 0, "slot 0 doit être réutilisé");
     }

@@ -5,7 +5,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use io_uring::{opcode, squeue, types};
+use io_uring::{opcode, types};
 
 use crate::runtime::sqe_queue_push;
 
@@ -97,6 +97,15 @@ impl<const N: usize> BufPool<N> {
         unsafe { self.base.add(abs * Self::BUF_SIZE) }
     }
 
+    /// Pointeur vers le buffer read d'index `buf_idx` dans l'allocation.
+    /// Utilisé par le runtime pour construire les entrées du buf_ring.
+    #[inline]
+    pub(crate) fn read_buf_addr(&self, buf_idx: u32) -> *const u8 {
+        debug_assert!(buf_idx < self.read_count);
+        // SAFETY: buf_idx < read_count, layout contigu.
+        unsafe { self.base.add(buf_idx as usize * Self::BUF_SIZE) }
+    }
+
     /// Table d'`iovec` couvrant TOUS les slots (read + write) pour
     /// `register_buffers`. Éphémère — à dropper après le syscall.
     pub fn build_iovecs(&self) -> Vec<libc::iovec> {
@@ -110,18 +119,13 @@ impl<const N: usize> BufPool<N> {
             .collect()
     }
 
-    /// Crée un `RwBuffer` depuis une CQE READ_FIXED.
+    /// Crée un `RwBuffer` depuis une CQE d'un read multishot.
     ///
-    /// `read_user_data` est réutilisé tel quel pour le READ_FIXED de replenish
-    /// (drop sans commit) et pour le READ_FIXED chainé (commit).
+    /// La release du slot buf_ring est différée :
+    /// - drop sans commit → release immédiate (userspace)
+    /// - commit()         → release après la CQE du WriteFixed (via CommitFuture)
     #[inline]
-    pub fn checkout_read(
-        &self,
-        buf_idx: u32,
-        fd_idx: u32,
-        bytes: u32,
-        read_user_data: u64,
-    ) -> RwBuffer<N> {
+    pub fn checkout_read(&self, buf_idx: u32, fd_idx: u32, bytes: u32) -> RwBuffer<N> {
         debug_assert!(buf_idx < self.read_count);
         RwBuffer {
             // SAFETY: buf_idx < read_count, layout contigu.
@@ -129,7 +133,6 @@ impl<const N: usize> BufPool<N> {
             buf_idx,
             fd_idx,
             bytes,
-            read_user_data,
             committed: false,
         }
     }
@@ -195,8 +198,7 @@ pub struct RwBuffer<const N: usize> {
     fd_idx: u32,
     /// Octets écrits par le kernel — peut être < BUF_SIZE (donnée au runtime).
     pub bytes: u32,
-    /// user_data réutilisé pour le READ_FIXED de replenish / chainé.
-    read_user_data: u64,
+    /// true si commit() a été appelé → CommitFuture gère la release du buf_ring.
     committed: bool,
 }
 
@@ -217,52 +219,23 @@ impl<const N: usize> RwBuffer<N> {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, BufPool::<N>::BUF_SIZE) }
     }
 
-    /// Soumet [WRITE_FIXED (IO_LINK) → READ_FIXED] dans sqe_queue.
+    /// Soumet un WriteFixed asynchrone et libère le slot buf_ring après confirmation.
     /// Consomme self — ne peut être appelé qu'une fois.
-    pub fn commit(mut self, len: u32) {
+    pub fn commit(mut self, len: u32) -> impl std::future::Future<Output = i32> {
         self.committed = true;
-
-        let write = opcode::WriteFixed::new(
-            types::Fixed(self.fd_idx),
-            self.ptr,
-            len,
-            self.buf_idx as u16,
-        )
-        .build()
-        .flags(squeue::Flags::IO_LINK)
-        .user_data(RWBUF_WRITE_UDATA);
-
-        let read = opcode::ReadFixed::new(
-            types::Fixed(self.fd_idx),
-            self.ptr,
-            BufPool::<N>::BUF_SIZE as u32,
-            self.buf_idx as u16,
-        )
-        .build()
-        .user_data(self.read_user_data);
-
-        sqe_queue_push(write);
-        sqe_queue_push(read);
-        // Drop run avec committed=true → no-op.
+        crate::calls::commit::make_commit_future::<N>(self.ptr, self.buf_idx, self.fd_idx, len)
     }
 }
 
 impl<const N: usize> Drop for RwBuffer<N> {
     fn drop(&mut self) {
         if self.committed {
+            // CommitFuture gère la release après la CQE du write.
             return;
         }
-        // Replenish : lecture seule terminée, on rend le slot au kernel.
-        let read = opcode::ReadFixed::new(
-            types::Fixed(self.fd_idx),
-            self.ptr,
-            BufPool::<N>::BUF_SIZE as u32,
-            self.buf_idx as u16,
-        )
-        .build()
-        .user_data(self.read_user_data);
-
-        sqe_queue_push(read);
+        // Lecture seule terminée (pas de commit) : rendre le slot au buf_ring immédiatement.
+        // Écriture userspace, zéro syscall.
+        crate::runtime::release_read_buf(self.buf_idx);
     }
 }
 

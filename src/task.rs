@@ -224,11 +224,12 @@ impl Task {
 
             //Once the task is totaly Drop we remove it from the slab in the runtime
             if let Some(task_idx) = idx {
+                println!("Task_id: {:?}, pushed rc=0", task_idx);
                 RUNTIME_FREE_LIST.with_borrow_mut(|l| l.push(task_idx))
             }
         }
     }
-    fn get_rc(&self) -> u16 {
+    pub(crate) fn get_rc(&self) -> u16 {
         unsafe { *self.ptr.as_ref().ref_counter.get() }
     }
     pub(crate) fn set_task_idx(&mut self, slab_idx: SlabIdx) {
