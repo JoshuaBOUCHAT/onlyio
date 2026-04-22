@@ -7,7 +7,10 @@ use std::{
 
 use io_uring::{opcode, types};
 
-use crate::runtime::sqe_queue_push;
+use crate::{
+    calls::write::{WriteResult, write_multiple},
+    runtime::sqe_queue_push,
+};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -221,9 +224,10 @@ impl<const N: usize> RwBuffer<N> {
 
     /// Soumet un WriteFixed asynchrone et libère le slot buf_ring après confirmation.
     /// Consomme self — ne peut être appelé qu'une fois.
-    pub fn commit(mut self, len: u32) -> impl std::future::Future<Output = i32> {
+    pub async fn commit(mut self, len: u32) -> i32 {
         self.committed = true;
         crate::calls::commit::make_commit_future::<N>(self.ptr, self.buf_idx, self.fd_idx, len)
+            .await
     }
 }
 
@@ -286,7 +290,16 @@ impl<const N: usize> WBuffer<N> {
                 .user_data(wbuf_write_udata(self.abs_idx));
 
         sqe_queue_push(write);
-        mem::forget(self); // skip Drop — rc décrémenté par on_write_cqe()
+    }
+    pub(crate) fn write(self, fd_idx: u32, len: u32, user_data: u64) -> io_uring::squeue::Entry {
+        opcode::WriteFixed::new(types::Fixed(fd_idx), self.ptr, len, self.abs_idx as u16)
+            .build()
+            .user_data(user_data)
+    }
+}
+impl WBuffer<1> {
+    pub async fn write_multiple(self, fds: Vec<u32>, len: u32) -> Vec<WriteResult> {
+        write_multiple(fds, self, len).await
     }
 }
 

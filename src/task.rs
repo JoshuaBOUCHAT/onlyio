@@ -56,7 +56,7 @@ pub(crate) enum SyscallNbCompResult {
     Multiple,
     Error,
 }
-
+pub const MULTIPLE_MASK: u16 = 0x8000;
 impl Task {
     /// Alloue une task contenant `future` inline.
     ///
@@ -114,8 +114,8 @@ impl Task {
     pub(crate) fn get_syscall_nb(&self) -> u16 {
         unsafe { *(*self.ptr.as_ptr()).syscall_nb.get() }
     }
+
     pub(crate) fn evaluate_syscall_nb(&self, incoming: u16) -> SyscallNbCompResult {
-        const MULTIPLE_MASK: u16 = 0x8000;
         let stored = self.get_syscall_nb();
         let stored_rank = stored & !MULTIPLE_MASK;
         let incoming_rank = incoming & !MULTIPLE_MASK;
@@ -139,7 +139,10 @@ impl Task {
     pub(crate) fn augmente_syscall_nb(&mut self) {
         unsafe {
             let nb_syscall = self.ptr.as_mut().syscall_nb.get_mut();
-            *nb_syscall = *nb_syscall + 1;
+            let nb_inc = (*nb_syscall & (!MULTIPLE_MASK))
+                .checked_add(1)
+                .expect("nb syscall overflow");
+            *nb_syscall = nb_inc;
         }
     }
 
@@ -165,8 +168,28 @@ impl Task {
         // SAFETY: single-thread, pas d'accès concurrent.
         unsafe {
             let rc = (*self.ptr.as_ptr()).ref_counter.get_mut();
-            *rc = *rc + 1;
+            let inc_rc = (*rc)
+                .checked_add(1)
+                .expect("Overflow add in inc_rc on a multiple task");
+            assert!(
+                *rc | MULTIPLE_MASK != inc_rc | MULTIPLE_MASK,
+                "Normal task a overflow into multiple task in inc_rc"
+            );
+            *rc = inc_rc;
         };
+    }
+    pub(crate) fn add_rc(&self, count: u16) {
+        unsafe {
+            let rc = (*self.ptr.as_ptr()).ref_counter.get_mut();
+            let inc_rc = (*rc)
+                .checked_add(count)
+                .expect("Overflow add in add_rc on a multiple task");
+            assert!(
+                *rc | MULTIPLE_MASK != inc_rc | MULTIPLE_MASK,
+                "Normal task a overflow into multiple task in add_rc"
+            );
+            *rc = inc_rc;
+        }
     }
 
     /// Consomme le handle sans décrémenter `ref_counter`.
@@ -225,7 +248,8 @@ impl Task {
             //Once the task is totaly Drop we remove it from the slab in the runtime
             if let Some(task_idx) = idx {
                 println!("Task_id: {:?}, pushed rc=0", task_idx);
-                RUNTIME_FREE_LIST.with_borrow_mut(|l| l.push(task_idx))
+                // try_with : évite la panic si la TLS est déjà détruite (fin de thread).
+                let _ = RUNTIME_FREE_LIST.try_with(|l| l.borrow_mut().push(task_idx));
             }
         }
     }

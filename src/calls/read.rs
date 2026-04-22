@@ -4,11 +4,11 @@ use std::{
     task::{Context, Poll},
 };
 
+use io_uring::cqueue;
+
 use crate::{
     buf_pool::RwBuffer,
-    runtime::{
-        GLOBAL_RUNTIME, current_cqe_flags, current_result, submit_read, submit_recv_multishot,
-    },
+    runtime::{GLOBAL_RUNTIME, current_cqe_flags, current_result, submit_read, submit_recv_multishot},
     stream::Stream,
 };
 
@@ -20,9 +20,9 @@ enum ReadFuture {
 }
 
 impl Future for ReadFuture {
-    type Output = RwBuffer<1>;
+    type Output = Result<RwBuffer<1>, i32>;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<RwBuffer<1>> {
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<RwBuffer<1>, i32>> {
         match *self {
             ReadFuture::Init(fd) => {
                 submit_read(fd);
@@ -31,16 +31,26 @@ impl Future for ReadFuture {
             }
             ReadFuture::Pending(fd) => {
                 let bytes = current_result();
-                let buf_id = (current_cqe_flags() >> 16) as u32;
+                let flags = current_cqe_flags();
+                // buffer_select() retourne Some(buf_id) si le kernel a consommé un slot
+                // du buf_ring — même sur EOF/erreur (kernel 5.19+). Il faut le rendre.
+                if bytes <= 0 {
+                    if let Some(buf_id) = cqueue::buffer_select(flags) {
+                        crate::runtime::release_read_buf(buf_id as u32);
+                    }
+                    return Poll::Ready(Err(bytes));
+                }
+                let buf_id = cqueue::buffer_select(flags)
+                    .expect("READ+BUFFER_SELECT: CQE positive sans buf_id") as u32;
                 let rwbuf = GLOBAL_RUNTIME
                     .with_borrow(|rt| rt.buffer.checkout_read(buf_id, fd, bytes as u32));
-                Poll::Ready(rwbuf)
+                Poll::Ready(Ok(rwbuf))
             }
         }
     }
 }
 
-pub async fn read(fd: u32) -> RwBuffer<1> {
+pub async fn read(fd: u32) -> Result<RwBuffer<1>, i32> {
     ReadFuture::Init(fd).await
 }
 
@@ -56,8 +66,6 @@ pub async fn read(fd: u32) -> RwBuffer<1> {
 //
 // Fin du multishot (résultat < 0, ou !F_MORE) :
 //   Le dernier item valide est livré (Some), puis None au poll suivant.
-
-const IORING_CQE_F_MORE: u32 = 1 << 1;
 
 enum ReadStreamState {
     Init,
@@ -91,16 +99,16 @@ impl Stream for ReadStream {
             }
             ReadStreamState::Running => {
                 let result = current_result();
+                let flags = current_cqe_flags();
                 if result < 0 {
-                    // Erreur ou fermeture connexion
                     self.state = ReadStreamState::Done;
                     return Poll::Ready(None);
                 }
-                let flags = current_cqe_flags();
-                let buf_id = (flags >> 16) as u32;
+                let buf_id = cqueue::buffer_select(flags)
+                    .expect("RECV_MULTISHOT: CQE positive sans buf_id") as u32;
                 let buf = GLOBAL_RUNTIME
                     .with_borrow(|rt| rt.buffer.checkout_read(buf_id, self.fd, result as u32));
-                if flags & IORING_CQE_F_MORE == 0 {
+                if !cqueue::more(flags) {
                     // Dernière CQE du multishot — prochain poll retourne None
                     self.state = ReadStreamState::Done;
                 }

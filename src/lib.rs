@@ -11,7 +11,9 @@ use buf_pool::{RwBuffer, WBuffer};
 use runtime::GLOBAL_RUNTIME;
 
 use crate::runtime::Runtime;
+pub use calls::accept::accept;
 pub use calls::accept::accept_stream;
+pub use calls::read::read;
 pub use calls::read::read_stream;
 
 //Pour l'instant la fonction est blocking et retourn rien
@@ -22,16 +24,18 @@ pub fn block_on(future: impl Future<Output = ()>) -> IOResult<()> {
 #[cfg(test)]
 mod test {
     use std::{
-        io::{Read, Write},
-        net::TcpStream,
+        io::{Cursor, Read, Write},
+        net::{TcpListener, TcpStream},
         os::unix::io::AsRawFd,
         thread,
         time::Duration,
     };
 
     use crate::{
-        block_on,
+        accept, block_on,
         calls::{accept::accept_stream, read::read_stream},
+        read,
+        runtime::spawn,
         stream::StreamExt,
     };
 
@@ -81,5 +85,98 @@ mod test {
         .unwrap();
 
         client.join().unwrap();
+    }
+    #[test]
+    fn stream_test() {
+        let tcp_stream = TcpListener::bind("0.0.0.0:6379").expect("enable to connect");
+        let fd = tcp_stream.as_raw_fd();
+
+        block_on(async {
+            let mut conns = accept_stream(fd);
+
+            let conn_fd = conns.next().await.expect("no more connexion");
+
+            let mut read_stream = read_stream(conn_fd);
+            let mut counter = 0;
+            while let Some(mut read) = read_stream.next().await {
+                println!(
+                    "Recieve: {}",
+                    std::string::String::from_utf8_lossy(read.read_slice())
+                );
+                counter += read.bytes;
+                let mut cursor = Cursor::new(read.write_slice());
+
+                write!(cursor, "Total number of char recieve is: {}", counter)
+                    .expect("can't write back the message");
+                let len = cursor.position() as usize;
+                read.commit(len as u32).await;
+            }
+            println!("read stream.next() returned None");
+        })
+        .expect("Error");
+    }
+
+    #[test]
+    fn test_two_connexion() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:6379").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listen_fd = listener.as_raw_fd();
+        let client = thread::spawn(|| {
+            thread::sleep(Duration::from_millis(1000));
+            let mut s = TcpStream::connect("127.0.0.1:6379").unwrap();
+            s.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 8];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"pingping");
+        });
+        let client = thread::spawn(|| {
+            thread::sleep(Duration::from_millis(1000));
+            let mut s = TcpStream::connect("127.0.0.1:6379").unwrap();
+            s.write_all(b"pong").unwrap();
+            let mut buf = [0u8; 8];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"pingping");
+        });
+        block_on(async {
+            loop {
+                let conn_fd = accept(listen_fd).await.expect("accept failed");
+                spawn(handle_connexion(conn_fd));
+            }
+        })
+        .expect("block on failed");
+    }
+    async fn handle_connexion(conn_fd: u32) {
+        loop {
+            let buffer = read(conn_fd).await.expect("Read failed");
+            let len = buffer.bytes;
+            if buffer.commit(len).await <= 0 {
+                println!("Ca a merdé mon coupain")
+            }
+        }
+    }
+    #[test]
+    fn test_close() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:6379").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listen_fd = listener.as_raw_fd();
+        let _ = thread::spawn(|| {
+            thread::sleep(Duration::from_millis(50));
+            let mut s = TcpStream::connect("127.0.0.1:6379").unwrap();
+            s.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping");
+        });
+        block_on(async {
+            let conn_fd = accept(listen_fd).await.expect("accept failed");
+            spawn(async {
+                let buffer = read(conn_fd).await.expect("Read failed");
+                let len = buffer.bytes;
+                if buffer.commit(len).await <= 0 {
+                    println!("Ca a merdé mon coupain")
+                }
+            });
+        })
+        .expect("block on failed");
     }
 }

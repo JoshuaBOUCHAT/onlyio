@@ -7,11 +7,11 @@ use std::{
 
 const PAGE_SIZE: usize = 4096;
 
-use io_uring::{IoUring, squeue::Entry};
+use io_uring::{IoUring, opcode, squeue::Entry};
 
 use crate::{
     IOResult,
-    buf_pool::BufPool,
+    buf_pool::{BufPool, WBuffer},
     task::{SyscallNbCompResult, Task},
     task_slab::{Slab, SlabIdx},
 };
@@ -49,6 +49,8 @@ impl Runtime {
     /// activable via `IoUring::builder().setup_sqpoll(idle_ms)` si besoin.
     fn new(entries: u32, max_connections: u32) -> IOResult<Self> {
         let ring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
             .build(entries)
             .expect("io_uring: échec de la création du ring");
 
@@ -112,7 +114,19 @@ impl Runtime {
             let mut sq = self.ring.submission();
             // SAFETY: les ptrs dans les SQEs proviennent de BufPool dont la
             // durée de vie dépasse celle du ring — stables tant que Runtime vit.
-
+            #[cfg(debug_assertions)]
+            {
+                for entry in &self.pending {
+                    let payload = UserDataPayload::from_sqe_entry(entry);
+                    println!(
+                        "   SQE:[ opt_code: {} gen: {}, syscall_nb:{}, task_idx:{:?} ]",
+                        entry.get_opcode(),
+                        payload.response_gen,
+                        payload.syscall_nb,
+                        payload.task_idx
+                    )
+                }
+            }
             unsafe {
                 sq.push_multiple(&self.pending)
                     .expect("SQ pleine — augmenter DEFAULT_RING_ENTRIES")
@@ -127,40 +141,25 @@ impl Runtime {
     }
 
     /// Insère la future dans le slab et retourne son index — sans la poller.
-    fn register_future(&mut self, future: impl Future<Output = ()>) -> SlabIdx {
-        let task = Task::new(future);
-        self.tasks.insert(task)
-    }
 
     pub(crate) fn block_on(future: impl Future<Output = ()>) -> IOResult<()> {
-        // Insertion dans le slab — borrow libéré immédiatement après.
-        let task_idx = GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().register_future(future));
+        spawn(future);
 
-        // Premier poll hors borrow : la future peut appeler submit_xxx librement.
-        {
-            let mut task = GLOBAL_RUNTIME.with_borrow(|rt| rt.tasks[task_idx].clone());
-            CURRENT_TASK.set(Some(TaskInfo::initial_poll(task_idx)));
-            let _ = task.poll();
-            println!("Test RC: {}", task.get_rc());
-            task.release();
-            println!("Test RC after release: {}", task.get_rc());
+        // Insertion dans le slab — borrow libéré immédiatement après.
+        let is_runtime_free = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
+            rt.free_unsed_slab_slot();
+            rt.tasks.count() == 0
+        });
+
+        if is_runtime_free {
+            return Ok(());
         }
-        println!(
-            "slab_count: {}",
-            GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.tasks.count())
-        );
-        println!("Droped");
-        println!(
-            "free list_size: {}",
-            RUNTIME_FREE_LIST.with_borrow(|l| l.len())
-        );
-        free_unsed_slab_slot();
 
         loop {
             // poll ready tasks
             let maybe_submit = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
                 if !rt.pending.is_empty() {
-                    println!("Submit {} sqe", rt.pending.len());
+                    println!("Submit {} SQE", rt.pending.len());
                     Some(rt.submit_and_wait())
                 } else {
                     None
@@ -175,26 +174,26 @@ impl Runtime {
                 GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().ring.completion().collect()); //Collect the entries outside the borow
             // to allow to borow GLOBAL_RUNTIME inside entry handling
             println!("Recieve {} CQE", entries.len());
+            #[cfg(debug_assertions)]
+            {
+                for entry in &entries {
+                    let payload = UserDataPayload::from_entry(entry);
+                    println!(
+                        "   SQE:[ result:{}, flags: {} gen: {}, syscall_nb:{}, task_idx:{:?} ]",
+                        entry.result(),
+                        entry.flags(),
+                        payload.response_gen,
+                        payload.syscall_nb,
+                        payload.task_idx
+                    )
+                }
+            }
             if entries.len() == 0 {
                 panic!("Entries len ==0 runtime shouldnt been wakeup");
             }
 
             for entry in entries {
-                // CQEs internes (WBuffer writes, etc.) — pas de task à réveiller.
-                /*if crate::buf_pool::is_internal_cqe(entry.user_data()) {
-                    continue;
-                }*/
-
-                // IORING_CQE_F_MORE : le kernel a encore des CQEs à envoyer pour ce SQE
-                // (multishot kernel : accept_multishot, recv_multishot…).
-                // Si set → ne pas appeler release() — le rc a été incrémenté une seule fois
-                // pour ce SQE et doit survivre jusqu'à la CQE finale.
-
-                let is_buffer = io_uring::cqueue::buffer_more(entry.flags());
-                let is_multishoot = io_uring::cqueue::more(entry.flags());
-                if is_more {
-                    println!("Recieve a is more");
-                }
+                let is_more = io_uring::cqueue::more(entry.flags());
 
                 let task_info = TaskInfo::from_entry(&entry);
                 let nb_syscall = task_info.tag.syscall_nb;
@@ -214,21 +213,23 @@ impl Runtime {
                         let _ = task.poll();
                     }
                     SyscallNbCompResult::Multiple => {
-                        println!("Recieve a multiple");
                         // Batch SQEs ou multishot kernel : toujours poller.
-                        // Release uniquement sur la CQE finale (pas de F_MORE).
+                        // Release uniquement sur la CQE finale (F_MORE absent).
                         CURRENT_TASK.set(Some(task_info));
                         let _ = task.poll();
                     }
                 }
-                //Should always release the task expect in is_more mode
+                // Release sauf si d'autres CQEs arrivent pour ce même SQE (F_MORE).
                 if !is_more {
                     task.release();
                 }
             }
-            free_unsed_slab_slot(); //Use the free list to clear finished task (use this mekanism of extern free list because of the cross borowing problem)
 
-            if GLOBAL_RUNTIME.with(|rt| rt.borrow().tasks.count()) == 0 {
+            let is_runtime_free = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
+                rt.free_unsed_slab_slot(); //Use the free list to clear finished task (use this mekanism of extern free list because of the cross borowing problem)
+                rt.tasks.count() == 0
+            });
+            if is_runtime_free {
                 break;
             }
         }
@@ -255,6 +256,7 @@ impl Runtime {
     fn send_read(&mut self, fd: u32) {
         let udata = self.current_udata(false);
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Read::new(
             io_uring::types::Fixed(fd),
@@ -389,19 +391,30 @@ impl Runtime {
         .user_data(udata);
         self.pending.push(sqe);
     }
-}
+    fn send_multiple_write(&mut self, fds: &[u32], buffer: WBuffer<1>, len: u32) {
+        let task_info = CURRENT_TASK.get().expect("get current task failed");
+        let mut user_data: UserDataPayload = (&task_info).into();
 
-fn free_unsed_slab_slot() {
-    GLOBAL_RUNTIME.with_borrow_mut(|rt| {
+        for (idx, &fd) in fds.into_iter().enumerate() {
+            user_data.response_gen = idx as u16;
+            let entry = buffer.clone().write(fd, len, user_data.into_user_data());
+            self.pending.push(entry);
+        }
+        self.tasks[user_data.task_idx].add_rc(fds.len() as u16);
+    }
+    pub(crate) fn advance_syscall_nb(&mut self, tag: &Tag) {
+        self.tasks[tag.task_idx].augmente_syscall_nb();
+    }
+    fn free_unsed_slab_slot(&mut self) {
         RUNTIME_FREE_LIST.with_borrow_mut(|f_list| {
             for &idx in f_list.iter() {
                 println!("Remove {:?}", idx);
-                let _ = rt.tasks.remove_dropped_task(idx);
-                println!("task size:{}", rt.tasks.count());
+                let _ = self.tasks.remove_dropped_task(idx);
+                println!("task size:{}", self.tasks.count());
             }
             f_list.clear();
         })
-    })
+    }
 }
 
 impl Drop for Runtime {
@@ -434,13 +447,20 @@ pub(crate) fn submit_commit_write(ptr: *const u8, fd_idx: u32, len: u32, buf_id:
     GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().send_commit_write(ptr, fd_idx, len, buf_id));
 }
 pub(crate) fn release_read_buf(buf_idx: u32) {
-    GLOBAL_RUNTIME.with_borrow(|rt| rt.release_buf_to_ring(buf_idx));
+    // try_with : no-op si la TLS est déjà détruite (fin de thread / panic déroulant).
+    let _ = GLOBAL_RUNTIME.try_with(|rt| rt.borrow().release_buf_to_ring(buf_idx));
 }
 pub(crate) fn submit_connect(fd: u32, addr: *const libc::sockaddr, addrlen: libc::socklen_t) {
     GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().send_connect(fd, addr, addrlen));
 }
 pub(crate) fn submit_socket() {
     GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().send_socket());
+}
+pub(crate) fn submit_multiple_write(fds: &[u32], buffer: WBuffer<1>, len: u32) {
+    GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.send_multiple_write(fds, buffer, len));
+}
+pub fn alloc_write_buffer() -> WBuffer<1> {
+    GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.buffer.alloc_write())
 }
 
 pub(crate) fn current_result() -> i32 {
@@ -457,6 +477,19 @@ pub(crate) fn current_cqe_flags() -> u32 {
             .flags
     })
 }
+pub fn spawn(future: impl Future<Output = ()>) {
+    let (mut task, old_context) = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
+        let task = Task::new(future);
+        let task_idx = rt.tasks.insert(task.clone());
+        let old_task_context = CURRENT_TASK.get();
+        CURRENT_TASK.set(Some(TaskInfo::initial_poll(task_idx)));
+        (task, old_task_context)
+    });
+
+    let _ = task.poll();
+    task.release(); //Every poll expect multishot should be followed by release
+    CURRENT_TASK.set(old_context); //Restore back the context of the task
+}
 
 union UserData {
     user_data: u64,
@@ -465,21 +498,29 @@ union UserData {
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 
-struct UserDataPayload {
+pub(crate) struct UserDataPayload {
     task_idx: SlabIdx,
     response_gen: u16,
     syscall_nb: u16,
 }
 #[derive(Clone, Copy)]
-struct TaskInfo {
+pub struct TaskInfo {
     pub(crate) tag: Tag,
     pub(crate) result: i32,
     pub(crate) flags: u32,
     pub(crate) response_gen: u16,
 }
-
+impl Into<UserDataPayload> for &TaskInfo {
+    fn into(self) -> UserDataPayload {
+        UserDataPayload {
+            task_idx: self.tag.task_idx,
+            response_gen: self.response_gen,
+            syscall_nb: self.tag.syscall_nb,
+        }
+    }
+}
 #[derive(Clone, Copy)]
-struct Tag {
+pub struct Tag {
     task_idx: SlabIdx,
     syscall_nb: u16,
 }
@@ -489,14 +530,19 @@ impl UserDataPayload {
         let data = UserData { user_data };
         unsafe { data.user_data_payload }
     }
-    fn into_user_data(self) -> u64 {
+    pub(crate) fn into_user_data(self) -> u64 {
         let data = UserData {
             user_data_payload: self,
         };
         unsafe { data.user_data }
     }
-    fn from_entry(entry: &io_uring::cqueue::Entry) -> Self {
+    pub(crate) fn from_entry(entry: &io_uring::cqueue::Entry) -> Self {
         let user_data = entry.user_data();
+        //Safety: As the user data comme from an entry, consider user_data as valid
+        unsafe { Self::from_user_data(user_data) }
+    }
+    pub(crate) fn from_sqe_entry(entry: &io_uring::squeue::Entry) -> Self {
+        let user_data = entry.get_user_data();
         //Safety: As the user data comme from an entry, consider user_data as valid
         unsafe { Self::from_user_data(user_data) }
     }

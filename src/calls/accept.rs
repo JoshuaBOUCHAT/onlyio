@@ -4,6 +4,8 @@ use std::{
     task::{Context, Poll},
 };
 
+use io_uring::cqueue;
+
 use crate::{
     runtime::{current_cqe_flags, current_result, submit_accept, submit_accept_multishot},
     stream::Stream,
@@ -11,30 +13,36 @@ use crate::{
 
 // ─── Single-shot ─────────────────────────────────────────────────────────────
 
-pub struct AcceptFuture {
-    listen_fd: i32,
-    submitted: bool,
+pub enum AcceptFuture {
+    Pending(i32),
+    Submited,
 }
 
 impl Future for AcceptFuture {
-    type Output = u32; // fixed_file_index
+    type Output = Result<u32, i32>; // fixed_file_index
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u32> {
-        if !self.submitted {
-            submit_accept(self.listen_fd);
-            self.submitted = true;
-            return Poll::Pending;
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<u32, i32>> {
+        match *self {
+            Self::Pending(fd) => {
+                submit_accept(fd);
+                *self = Self::Submited;
+                Poll::Pending
+            }
+            Self::Submited => {
+                println!("Recieve a connect");
+                let res = current_result();
+                if res >= 0 {
+                    Poll::Ready(Ok(res as u32))
+                } else {
+                    Poll::Ready(Err(res))
+                }
+            }
         }
-        println!("Recieve a conn");
-        Poll::Ready(current_result() as u32)
     }
 }
 
-pub fn accept(listen_fd: i32) -> AcceptFuture {
-    AcceptFuture {
-        listen_fd,
-        submitted: false,
-    }
+pub async fn accept(listen_fd: i32) -> Result<u32, i32> {
+    AcceptFuture::Pending(listen_fd).await
 }
 
 // ─── Multishot stream ─────────────────────────────────────────────────────────
@@ -44,8 +52,6 @@ pub fn accept(listen_fd: i32) -> AcceptFuture {
 //
 // Fin du multishot (résultat < 0, ou !F_MORE) :
 //   Le dernier fd valide est livré (Some), puis None au poll suivant.
-
-const IORING_CQE_F_MORE: u32 = 1 << 1;
 
 enum AcceptStreamState {
     Init,
@@ -84,8 +90,7 @@ impl Stream for AcceptStream {
                     self.state = AcceptStreamState::Done;
                     return Poll::Ready(None);
                 }
-                let flags = current_cqe_flags();
-                if flags & IORING_CQE_F_MORE == 0 {
+                if !cqueue::more(current_cqe_flags()) {
                     self.state = AcceptStreamState::Done;
                 }
                 Poll::Ready(Some(result as u32))
