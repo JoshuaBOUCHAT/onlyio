@@ -10,7 +10,7 @@ Single-threaded async runtime built entirely on `io_uring`. Designed as the exec
 
 ### Event loop
 
-One thread, one syscall per iteration (`io_uring_enter`). SQEs produced during task polling accumulate in a staging buffer and are flushed together — enabling N SQEs in a single `io_uring_enter` call (fan-out, pub/sub, batch writes).
+One thread. SQEs produced during task polling accumulate in a staging buffer; a single `io_uring_enter` flushes the entire batch and blocks until at least one CQE arrives. This means one kernel transition per batch — not one per operation. N SQEs (fan-out, batch writes) cross the kernel boundary together, which is the primary source of efficiency.
 
 ```
 1. WAKE_LIST  — full drain (userspace, 0 syscall)
@@ -48,7 +48,7 @@ One allocation per task: header + future inline.
 
 ### Connections — kernel-owned fds
 
-`IORING_OP_ACCEPT_MULTISHOT` + `IORING_ACCEPT_DIRECT`: one SQE accepts all incoming connections. Each CQE yields a `fixed_file_index` — invisible to `/proc/pid/fd`, `lsof`, `ss`. Fixed-file table pre-registered as sparse via `IORING_REGISTER_FILES_SPARSE`.
+`IORING_ACCEPT_DIRECT`: accepted connections are installed directly into the kernel's fixed-file table — invisible to `/proc/pid/fd`, `lsof`, `ss`. The table is pre-registered as sparse via `IORING_REGISTER_FILES_SPARSE`. Each CQE yields a `fixed_file_index` used for all subsequent operations on that connection.
 
 ### Buffers — split read/write pool
 
@@ -143,6 +143,10 @@ Requires Linux 5.19+ at runtime. Tested on 6.19.
 
 ## Roadmap
 
+### Multishot accept via `.incoming(conn_handler)`
+
+`IORING_OP_ACCEPT_MULTISHOT` will be exposed through a dedicated `.incoming(|conn_fd| async { ... })` API rather than a raw stream. This forces a new task to be spawned per connection — which is the correct model given how the runtime dispatches CQEs — and keeps multishot accept isolated from the read path, where multishot is currently not viable due to how task polling is structured.
+
 ### Standard `Waker` interface
 
 The current wake mechanism is a hand-rolled `WAKE_LIST` — efficient but opaque. The goal is to expose a proper `std::task::Waker` so that onlyio futures can compose with any external code that drives a standard `Future`. This requires implementing a vtable-backed `RawWaker` that pushes into the runtime's wake list, without breaking the existing zero-alloc invariant (the waker itself stays stack-allocated).
@@ -161,4 +165,3 @@ Today all write buffers are fixed at 4096 bytes. Fan-out of large payloads (e.g.
 
 - [`io-uring`](https://crates.io/crates/io-uring) — safe bindings to the Linux io_uring API
 - [`libc`](https://crates.io/crates/libc) — raw socket / syscall types
-- `hislab` *(local crate, `../../hislab`)* — O(1) slab allocator backed by `mmap` + hierarchical bitmap
