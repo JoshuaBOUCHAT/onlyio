@@ -1,6 +1,7 @@
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     cell::{Cell, RefCell},
+    collections::VecDeque,
     num::NonZero,
     u16, u32,
 };
@@ -28,6 +29,7 @@ thread_local! {
     );
     pub static CURRENT_TASK:Cell<Option<TaskInfo>>=Cell::new(None);
     pub static RUNTIME_FREE_LIST:RefCell<Vec<SlabIdx>>=RefCell::new(Vec::new());
+    pub static RUNTIME_WAKE_LIST:RefCell<VecDeque<TaskInfo>>=RefCell::new(VecDeque::new());
 }
 
 pub(crate) struct Runtime {
@@ -38,6 +40,8 @@ pub(crate) struct Runtime {
     buf_ring: *mut u8,
     buf_ring_layout: Layout,
 }
+pub type SqeEntry = io_uring::squeue::Entry;
+pub type CqeEntry = io_uring::cqueue::Entry;
 
 impl Runtime {
     /// Initialise le ring io_uring et enregistre la fixed files table sparse.
@@ -107,33 +111,28 @@ impl Runtime {
         })
     }
     fn submit_and_wait(&mut self) -> IOResult<usize> {
+        let mut sq = self.ring.submission();
+        // SAFETY: les ptrs dans les SQEs proviennent de BufPool dont la
+        // durée de vie dépasse celle du ring — stables tant que Runtime vit.
+        #[cfg(debug_assertions)]
         {
-            if self.pending.is_empty() {
-                panic!("call submit on 0 entry");
+            for entry in &self.pending {
+                let payload = UserDataPayload::from_sqe_entry(entry);
+                println!(
+                    "   SQE:[ opt_code: {} gen: {}, syscall_nb:{}, task_idx:{:?} ]",
+                    entry.get_opcode(),
+                    payload.response_gen,
+                    payload.syscall_nb,
+                    payload.task_idx
+                )
             }
-            let mut sq = self.ring.submission();
-            // SAFETY: les ptrs dans les SQEs proviennent de BufPool dont la
-            // durée de vie dépasse celle du ring — stables tant que Runtime vit.
-            #[cfg(debug_assertions)]
-            {
-                for entry in &self.pending {
-                    let payload = UserDataPayload::from_sqe_entry(entry);
-                    println!(
-                        "   SQE:[ opt_code: {} gen: {}, syscall_nb:{}, task_idx:{:?} ]",
-                        entry.get_opcode(),
-                        payload.response_gen,
-                        payload.syscall_nb,
-                        payload.task_idx
-                    )
-                }
-            }
-            unsafe {
-                sq.push_multiple(&self.pending)
-                    .expect("SQ pleine — augmenter DEFAULT_RING_ENTRIES")
-            }
-            self.pending.clear();
         }
-
+        unsafe {
+            sq.push_multiple(&self.pending)
+                .expect("SQ pleine — augmenter DEFAULT_RING_ENTRIES")
+        }
+        self.pending.clear();
+        drop(sq);
         self.ring.submit_and_wait(1)
     }
     fn sqe_queue_push(&mut self, entry: Entry) {
@@ -157,72 +156,38 @@ impl Runtime {
 
         loop {
             // poll ready tasks
-            let maybe_submit = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
-                if !rt.pending.is_empty() {
-                    println!("Submit {} SQE", rt.pending.len());
-                    Some(rt.submit_and_wait())
-                } else {
-                    None
-                }
+            let _ = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
+                println!("Submit {} SQE", rt.pending.len());
+                rt.submit_and_wait()
+            })?;
+            let is_runtime_free = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
+                rt.free_unsed_slab_slot(); //Use the free list to clear finished task (use this mekanism of extern free list because of the cross borowing problem)
+                rt.tasks.count() == 0
             });
-            if let Some(submit) = maybe_submit {
-                if submit? == 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+            if is_runtime_free {
+                break;
             }
+
             let entries: Vec<_> =
                 GLOBAL_RUNTIME.with(|rt| rt.borrow_mut().ring.completion().collect()); //Collect the entries outside the borow
             // to allow to borow GLOBAL_RUNTIME inside entry handling
             println!("Recieve {} CQE", entries.len());
             #[cfg(debug_assertions)]
-            {
-                for entry in &entries {
-                    let payload = UserDataPayload::from_entry(entry);
-                    println!(
-                        "   SQE:[ result:{}, flags: {} gen: {}, syscall_nb:{}, task_idx:{:?} ]",
-                        entry.result(),
-                        entry.flags(),
-                        payload.response_gen,
-                        payload.syscall_nb,
-                        payload.task_idx
-                    )
-                }
-            }
+            debug_cqe_entries(&entries);
             if entries.len() == 0 {
                 panic!("Entries len ==0 runtime shouldnt been wakeup");
             }
 
             for entry in entries {
-                let is_more = io_uring::cqueue::more(entry.flags());
-
-                let task_info = TaskInfo::from_entry(&entry);
-                let nb_syscall = task_info.tag.syscall_nb;
-                let task_idx = task_info.tag.task_idx;
+                Self::handle_cqe_entry(&entry);
+            }
+            while let Some(awake) =
+                RUNTIME_WAKE_LIST.with_borrow_mut(|awake_list| awake_list.pop_front())
+            {
+                let task_idx = awake.tag.task_idx;
+                CURRENT_TASK.set(Some(awake));
                 let mut task = GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.tasks[task_idx].clone());
-
-                match task.evaluate_syscall_nb(nb_syscall) {
-                    SyscallNbCompResult::Error => {
-                        panic!("Recieve a SQE newer than expected")
-                    }
-                    SyscallNbCompResult::Expired => {}
-                    SyscallNbCompResult::Normal => {
-                        let mut task_info = task_info;
-                        task_info.tag.syscall_nb += 1;
-                        task.augmente_syscall_nb();
-                        CURRENT_TASK.set(Some(task_info));
-                        let _ = task.poll();
-                    }
-                    SyscallNbCompResult::Multiple => {
-                        // Batch SQEs ou multishot kernel : toujours poller.
-                        // Release uniquement sur la CQE finale (F_MORE absent).
-                        CURRENT_TASK.set(Some(task_info));
-                        let _ = task.poll();
-                    }
-                }
-                // Release sauf si d'autres CQEs arrivent pour ce même SQE (F_MORE).
-                if !is_more {
-                    task.release();
-                }
+                let _ = task.poll();
             }
 
             let is_runtime_free = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
@@ -235,26 +200,75 @@ impl Runtime {
         }
         Ok(())
     }
+    fn augmente_syscall_nb(&mut self, tag: &Tag) {
+        self.tasks[tag.task_idx].augmente_syscall_nb();
+    }
+    fn handle_cqe_entry(entry: &CqeEntry) {
+        let is_buffer = io_uring::cqueue::buffer_more(entry.flags());
+        let is_multishoot = io_uring::cqueue::more(entry.flags());
+        if is_multishoot {
+            println!("Recieve a is more");
+        }
+        if is_buffer {
+            println!("Recieve a is buffer");
+        }
+
+        let task_info = TaskInfo::from_entry(&entry);
+        let nb_syscall = task_info.tag.syscall_nb;
+        let task_idx = task_info.tag.task_idx;
+        let mut task = GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.tasks[task_idx].clone());
+
+        match task.evaluate_syscall_nb(nb_syscall) {
+            SyscallNbCompResult::Error => {
+                panic!("Recieve a SQE newer than expected")
+            }
+            SyscallNbCompResult::Expired => {}
+            SyscallNbCompResult::Normal => {
+                let mut task_info = task_info;
+                task_info.tag.syscall_nb += 1;
+                task.augmente_syscall_nb();
+                CURRENT_TASK.set(Some(task_info));
+                let _ = task.poll();
+            }
+            SyscallNbCompResult::Multiple => {
+                println!("Recieve a multiple");
+                // Batch SQEs ou multishot kernel : toujours poller.
+                // Release uniquement sur la CQE finale (pas de F_MORE).
+                CURRENT_TASK.set(Some(task_info));
+                let _ = task.poll();
+            }
+        }
+        //Should always release the task expect in is_more mode
+        if !is_multishoot {
+            task.release();
+        }
+    }
+    fn set_current_task_multiple(is_multiple: bool) {
+        let mut current_task = CURRENT_TASK.get().expect("appelé hors contexte runtime");
+        if is_multiple {
+            current_task.tag.syscall_nb |= 0x8000;
+        } else {
+            current_task.tag.syscall_nb &= !0x8000;
+        }
+        CURRENT_TASK.set(Some(current_task));
+    }
+
     /// user_data pour la task courante. `multishot=true` pose le MULTIPLE_MASK sur syscall_nb.
-    fn current_udata(&self, multishot: bool) -> u64 {
+    fn current_udata() -> u64 {
         CURRENT_TASK.with(|c| {
             let info = c.get().expect("appelé hors contexte runtime");
-            let syscall_nb = if multishot {
-                info.tag.syscall_nb | 0x8000 // MULTIPLE_MASK
-            } else {
-                info.tag.syscall_nb
-            };
+
             UserDataPayload {
                 task_idx: info.tag.task_idx,
-                response_gen: 0,
-                syscall_nb,
+                response_gen: info.response_gen,
+                syscall_nb: info.tag.syscall_nb,
             }
             .into_user_data()
         })
     }
 
     fn send_read(&mut self, fd: u32) {
-        let udata = self.current_udata(false);
+        let udata = Self::current_udata();
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
 
         self.tasks[task_idx].inc_rc();
@@ -273,7 +287,7 @@ impl Runtime {
     /// ACCEPT_DIRECT single-shot : une connexion entrante → un fixed_file_index.
     /// `listen_fd` est le fd du socket en écoute (non-fixed).
     fn send_accept(&mut self, listen_fd: i32) {
-        let udata = self.current_udata(false);
+        let udata = Self::current_udata();
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Accept::new(
@@ -289,7 +303,7 @@ impl Runtime {
 
     /// WRITE_FIXED : envoie `len` octets du buffer `buf_id` sur `fd` (fixed file).
     fn send_write(&mut self, fd: u32, buf_id: u16, len: u32) {
-        let udata = self.current_udata(false);
+        let udata = Self::current_udata();
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let buf_ptr = self.buffer.write_buf_ptr(buf_id);
@@ -303,7 +317,8 @@ impl Runtime {
     /// RECV_MULTISHOT : un seul SQE, N CQEs via IORING_CQE_F_MORE.
     /// MULTIPLE_MASK posé → la task est repollée sur chaque CQE.
     fn send_recv_multishot(&mut self, fd: u32) {
-        let udata = self.current_udata(true); // MULTIPLE_MASK
+        Self::set_current_task_multiple(true);
+        let udata = Self::current_udata(); // MULTIPLE_MASK
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
         self.tasks[task_idx].set_multishot();
         self.tasks[task_idx].inc_rc();
@@ -316,7 +331,8 @@ impl Runtime {
     /// ACCEPT_MULTISHOT + ACCEPT_DIRECT : un seul SQE accepte toutes les connexions entrantes.
     /// Chaque CQE donne un fixed_file_index. MULTIPLE_MASK posé → task repollée à chaque CQE.
     fn send_accept_multishot(&mut self, listen_fd: i32) {
-        let udata = self.current_udata(true); // MULTIPLE_MASK
+        Self::set_current_task_multiple(true);
+        let udata = Self::current_udata(); // MULTIPLE_MASK
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
         self.tasks[task_idx].set_multishot();
         self.tasks[task_idx].inc_rc();
@@ -330,7 +346,8 @@ impl Runtime {
     /// WriteFixed pour `commit()` : soumet le write, réveille la task via la CQE.
     /// Pas de replenish read — le buf_ring est libéré en userspace après la CQE.
     fn send_commit_write(&mut self, ptr: *const u8, fd_idx: u32, len: u32, buf_id: u16) {
-        let udata = self.current_udata(false);
+        Self::set_current_task_multiple(true);
+        let udata = Self::current_udata(); // MULTIPLE_MASK
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let sqe =
@@ -367,7 +384,7 @@ impl Runtime {
     /// CONNECT : connecte `fd` (fixed file) à `addr`.
     /// `addr` doit rester valide jusqu'à la CQE — la future doit la stocker inline.
     fn send_connect(&mut self, fd: u32, addr: *const libc::sockaddr, addrlen: libc::socklen_t) {
-        let udata = self.current_udata(false);
+        let udata = Self::current_udata();
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Connect::new(io_uring::types::Fixed(fd), addr, addrlen)
@@ -378,7 +395,7 @@ impl Runtime {
 
     /// SOCKET : crée un socket TCP (SOCK_STREAM) et l'installe dans un slot fixed-file auto.
     fn send_socket(&mut self) {
-        let udata = self.current_udata(false);
+        let udata = Self::current_udata();
         let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Socket::new(
@@ -414,6 +431,19 @@ impl Runtime {
             }
             f_list.clear();
         })
+    }
+}
+fn debug_cqe_entries(entries: &[CqeEntry]) {
+    for entry in entries {
+        let payload = UserDataPayload::from_entry(entry);
+        println!(
+            "   SQE:[ result:{}, flags: {} gen: {}, syscall_nb:{}, task_idx:{:?} ]",
+            entry.result(),
+            entry.flags(),
+            payload.response_gen,
+            payload.syscall_nb,
+            payload.task_idx
+        )
     }
 }
 
@@ -570,6 +600,19 @@ impl TaskInfo {
             response_gen: payload.response_gen,
         }
     }
+    fn from_waker(waker: Waker) -> Self {
+        let res = Self {
+            tag: Tag {
+                task_idx: waker.payload.task_idx,
+                syscall_nb: waker.payload.response_gen,
+            },
+            result: i32::MIN,
+            flags: u32::MAX,
+            response_gen: waker.payload.response_gen,
+        };
+        std::mem::forget(waker);
+        res
+    }
 }
 
 impl Tag {
@@ -578,5 +621,29 @@ impl Tag {
             task_idx,
             syscall_nb: 0,
         }
+    }
+}
+
+#[repr(transparent)]
+pub struct Waker {
+    payload: UserDataPayload,
+}
+impl Into<Waker> for UserDataPayload {
+    fn into(self) -> Waker {
+        Waker { payload: self }
+    }
+}
+impl Waker {
+    pub fn awake(self) {
+        RUNTIME_WAKE_LIST.with_borrow_mut(|f| {
+            f.push_back(TaskInfo::from_waker(self));
+        })
+    }
+}
+impl Drop for Waker {
+    fn drop(&mut self) {
+        GLOBAL_RUNTIME.with_borrow_mut(|rt| {
+            rt.tasks[self.payload.task_idx].release();
+        })
     }
 }

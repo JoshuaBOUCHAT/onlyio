@@ -122,7 +122,7 @@ mod test {
         listener.set_nonblocking(true).unwrap();
         let listen_fd = listener.as_raw_fd();
         let client = thread::spawn(|| {
-            thread::sleep(Duration::from_millis(1000));
+            thread::sleep(Duration::from_millis(50));
             let mut s = TcpStream::connect("127.0.0.1:6379").unwrap();
             s.write_all(b"ping").unwrap();
             let mut buf = [0u8; 8];
@@ -130,7 +130,7 @@ mod test {
             assert_eq!(&buf, b"pingping");
         });
         let client = thread::spawn(|| {
-            thread::sleep(Duration::from_millis(1000));
+            thread::sleep(Duration::from_millis(50));
             let mut s = TcpStream::connect("127.0.0.1:6379").unwrap();
             s.write_all(b"pong").unwrap();
             let mut buf = [0u8; 8];
@@ -138,7 +138,7 @@ mod test {
             assert_eq!(&buf, b"pingping");
         });
         block_on(async {
-            loop {
+            for _ in 0..2 {
                 let conn_fd = accept(listen_fd).await.expect("accept failed");
                 spawn(handle_connexion(conn_fd));
             }
@@ -146,13 +146,9 @@ mod test {
         .expect("block on failed");
     }
     async fn handle_connexion(conn_fd: u32) {
-        loop {
-            let buffer = read(conn_fd).await.expect("Read failed");
-            let len = buffer.bytes;
-            if buffer.commit(len).await <= 0 {
-                println!("Ca a merdé mon coupain")
-            }
-        }
+        let buffer = read(conn_fd).await.expect("Read failed");
+        let len = buffer.bytes;
+        assert!(buffer.commit(len).await > 0, "Buffer commit failed");
     }
     #[test]
     fn test_close() {
@@ -172,9 +168,7 @@ mod test {
             spawn(async {
                 let buffer = read(conn_fd).await.expect("Read failed");
                 let len = buffer.bytes;
-                if buffer.commit(len).await <= 0 {
-                    println!("Ca a merdé mon coupain")
-                }
+                assert!(buffer.commit(len).await > 0, "Buffer commit failed");
             });
         })
         .expect("block on failed");

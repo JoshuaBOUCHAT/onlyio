@@ -229,7 +229,7 @@ impl Task {
 
         result
     }
-    pub(crate) fn release(&mut self) {
+    pub(crate) fn release(&mut self) -> u16 {
         let raw = unsafe { self.ptr.as_mut() };
         let counter = raw.ref_counter.get_mut();
         *counter = *counter - 1;
@@ -252,6 +252,7 @@ impl Task {
                 let _ = RUNTIME_FREE_LIST.try_with(|l| l.borrow_mut().push(task_idx));
             }
         }
+        *counter
     }
     pub(crate) fn get_rc(&self) -> u16 {
         unsafe { *self.ptr.as_ref().ref_counter.get() }

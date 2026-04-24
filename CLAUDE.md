@@ -107,6 +107,137 @@ hislab = { path = "../../hislab" }
 | `ACCEPT_DIRECT` + `MULTISHOT` | 5.19 |
 | Machine cible | 6.19 ✓ |
 
+### Communication inter-task — `Waker` / `WAKE_LIST` / `YIELD_LIST`
+
+#### Vue d'ensemble de l'event loop
+
+Chaque tour de `block_on` s'exécute dans cet ordre strict :
+
+```
+1. WAKE_LIST  — drain complet (userspace, 0 syscall)
+2. YIELD_LIST — un seul pass par tour (snapshot, anti-starvation)
+3. free_unsed_slab_slot + check tasks.count() == 0 → break
+4. submit_and_wait (io_uring_enter — seul syscall du tour)
+5. Process CQEs
+```
+
+Les étapes 1–2 n'appellent jamais `io_uring_enter`. Tout ce qui s'y produit
+(chaînes de wakes, soumissions de SQEs) s'accumule et part en batch à l'étape 4.
+
+#### `Waker` — 8 bytes, stack-allocated
+
+```rust
+pub struct Waker {
+    payload: UserDataPayload,   // task_idx(32b) + response_gen(16b) + syscall_nb(16b)
+}
+```
+
+**Construction** (`Waker::new(gen: u16)`) :
+- Lit `CURRENT_TASK` pour obtenir `task_idx` + `syscall_nb` courant.
+- Appelle `rt.tasks[task_idx].inc_rc()` via le slot slab (pas de clone, 0 alloc).
+- Stocke `gen` dans `response_gen` — identifie la branche dans un select.
+
+**`wake(self, result: i32)`** :
+- Construit un `TaskInfo { tag, result, flags: 0, response_gen: gen }`.
+- Pousse dans `WAKE_LIST`.
+- `mem::forget(self)` — Drop ne tourne pas, le rc reste élevé (transféré au runtime).
+
+**`Drop`** (waker droppé sans wake) :
+- `rt.tasks[task_idx].release()` via `GLOBAL_RUNTIME.try_with(...)`.
+- `try_with` : no-op si la TLS est déjà détruite (fin de thread / panic).
+
+#### `WAKE_LIST: RefCell<VecDeque<TaskInfo>>`
+
+Drain **complet** à chaque tour (pas de snapshot). Un wake produit pendant le
+drain atterrit dans `WAKE_LIST` et est consommé dans le **même** tour — les
+chaînes `A réveille B → B fait IO → SQE soumis` tiennent en un seul passage,
+latence minimale.
+
+**Comptage rc pour un wake :**
+```
+Waker::new   → inc_rc           (+1 waker)
+wake()       → mem::forget      (rc reste élevé)
+Runtime      → clone            (+1 clone local)
+             → task.release()   (-1 : consomme le rc waker)
+             → task drop        (-1 : consomme le clone local)
+net          → 0  ✓
+```
+
+**Stale detection** : deux wakers créés pour un select ont le même `syscall_nb`.
+Le premier `wake()` déclenche un poll → `augmente_syscall_nb()`. Le second
+arrive avec l'ancien `syscall_nb` → `Expired` → ignoré + `rc--`. Zéro
+modification du mécanisme CQE existant.
+
+**Invariant de terminaison du drain** : après le poll d'une task via `wake`,
+son `syscall_nb` est incrémenté. Tout wake ultérieur avec l'ancien numéro →
+Expired. Même un cycle A→B→A converge. Les tasks qui veulent se re-wake
+intentionnellement utilisent `YIELD_LIST`, pas `WAKE_LIST`.
+
+#### `YIELD_LIST: RefCell<VecDeque<UserDataPayload>>`
+
+Drain **snapshot** (un pass par tour) pour anti-starvation. Une task qui se
+re-yield indéfiniment n'affame pas les autres tasks ni les CQEs.
+
+`UserDataPayload` seulement (pas de `result`) — le yield ne passe pas de valeur.
+Les re-yields produits pendant le pass atterrissent dans `YIELD_LIST` et
+attendent le tour suivant.
+
+**`yield_now()`** — zéro syscall, zéro alloc :
+```
+Premier poll  → push UserDataPayload dans YIELD_LIST + inc_rc → Poll::Pending
+Deuxième poll → Poll::Ready(())
+```
+
+#### Pattern select (exemple radixox : `read_or_canceled`)
+
+```
+parent task (syscall_nb = N)
+  │
+  ├─ Waker::new(gen=0)  → payload { syscall_nb: N, gen: 0 }   rc++
+  ├─ Waker::new(gen=1)  → payload { syscall_nb: N, gen: 1 }   rc++
+  │
+  ├─ spawn(task_read)   → quand fini : waker.wake(result)  →  WAKE_LIST
+  ├─ spawn(task_cancel) → quand fini : waker.wake(0)       →  WAKE_LIST
+  │
+  └─ Poll::Pending
+
+Premier wake arrivé (ex. gen=0, syscall_nb=N) :
+  → Normal → augmente_syscall_nb (N→N+1) → CURRENT_TASK.response_gen = 0
+  → parent re-pollé : lit response_gen → sait que c'est le read qui a gagné
+
+Deuxième wake (gen=1, syscall_nb=N) :
+  → Expired (interne = N+1) → ignoré → rc--  ✓
+```
+
+Le sous-task perdant se termine proprement (sa CQE stale est ignorée via le
+même mécanisme). Pas d'annulation active pour l'instant (passif = simple).
+
+#### Appel spécialisé intra-task (optimisation future)
+
+Pour éviter l'overhead de spawn dans les cas fréquents (ex. `RECV_MULTISHOT`
+avec cancel), une API dédiée poll directement les deux branches dans la task
+courante sans waker externe. À ajouter quand le besoin se précise dans radixox.
+
+#### Timer — task permanente
+
+```
+spawn(async move {
+    loop {
+        timeout(interval).await;   // IORING_OP_TIMEOUT SQE → CQE après `interval`
+        callback();
+    }
+});
+```
+
+La task timer vit indéfiniment dans le slab (jamais `Poll::Ready`).
+Coût : un SQE par intervalle, une alloc à l'init. Zéro alloc sur le chemin chaud.
+
+#### Règle : waker mode ≠ SQE mode
+
+Une task en attente de wakers **ne soumet pas de SQE** pour le même
+`syscall_nb`. Elle spawne des sous-tasks qui soumettent les SQEs et la réveillent
+via waker. Mélanger SQE et waker sur le même `syscall_nb` causerait deux polls.
+
 ## Règles de rigueur
 
 - **Aucune allocation sur le chemin chaud** : pas de `Vec::push` / `Box::new` hors init.
