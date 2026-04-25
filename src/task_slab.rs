@@ -70,6 +70,12 @@ impl Drop for SlabSlot {
 #[repr(transparent)]
 pub(crate) struct SlabIdx(u32);
 
+impl SlabIdx {
+    pub(crate) fn dummy() -> Self {
+        Self(u32::MAX)
+    }
+}
+
 /// Slab de Tasks avec free list intrusive.
 ///
 /// Invariant : `head` est toujours un index valide vers le prochain slot libre,

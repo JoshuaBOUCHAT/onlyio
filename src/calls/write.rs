@@ -86,9 +86,7 @@ impl Future for WriteMultipleFuture {
         };
 
         *in_fligth_count = *in_fligth_count - 1;
-        let task_info = CURRENT_TASK
-            .get()
-            .expect("unable to get current task in WriteMultipleFuture");
+        let task_info = CURRENT_TASK.get();
 
         let gen_result = task_info.response_gen;
         let fd = fds[gen_result as usize];
@@ -109,6 +107,9 @@ impl Future for WriteMultipleFuture {
 
         if *in_fligth_count == 0 {
             GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.advance_syscall_nb(&task_info.tag));
+            let mut task_info = CURRENT_TASK.get();
+            task_info.set_to_next_task();
+            CURRENT_TASK.set(task_info);
             return Poll::Ready(std::mem::take(faileds));
         }
         Poll::Pending

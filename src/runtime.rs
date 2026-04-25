@@ -13,7 +13,7 @@ use io_uring::{IoUring, opcode, squeue::Entry};
 use crate::{
     IOResult,
     buf_pool::{BufPool, WBuffer},
-    task::{SyscallNbCompResult, Task},
+    task::{MULTIPLE_MASK, SyscallNbCompResult, Task},
     task_slab::{Slab, SlabIdx},
 };
 
@@ -27,7 +27,7 @@ thread_local! {
     pub static GLOBAL_RUNTIME: RefCell<Runtime> = RefCell::new(
         Runtime::new(DEFAULT_RING_ENTRIES, DEFAULT_MAX_CONNECTIONS).expect("Runtime creation failed")
     );
-    pub static CURRENT_TASK:Cell<Option<TaskInfo>>=Cell::new(None);
+    pub static CURRENT_TASK:Cell<TaskInfo>=Cell::new(TaskInfo::dummy());
     pub static RUNTIME_FREE_LIST:RefCell<Vec<SlabIdx>>=RefCell::new(Vec::new());
     pub static RUNTIME_WAKE_LIST:RefCell<VecDeque<TaskInfo>>=RefCell::new(VecDeque::new());
 }
@@ -185,7 +185,7 @@ impl Runtime {
                 RUNTIME_WAKE_LIST.with_borrow_mut(|awake_list| awake_list.pop_front())
             {
                 let task_idx = awake.tag.task_idx;
-                CURRENT_TASK.set(Some(awake));
+                CURRENT_TASK.set(awake);
                 let mut task = GLOBAL_RUNTIME.with_borrow_mut(|rt| rt.tasks[task_idx].clone());
                 let _ = task.poll();
             }
@@ -200,7 +200,7 @@ impl Runtime {
         }
         Ok(())
     }
-    fn augmente_syscall_nb(&mut self, tag: &Tag) {
+    pub(crate) fn augmente_syscall_nb(&mut self, tag: &Tag) {
         self.tasks[tag.task_idx].augmente_syscall_nb();
     }
     fn handle_cqe_entry(entry: &CqeEntry) {
@@ -227,14 +227,14 @@ impl Runtime {
                 let mut task_info = task_info;
                 task_info.tag.syscall_nb += 1;
                 task.augmente_syscall_nb();
-                CURRENT_TASK.set(Some(task_info));
+                CURRENT_TASK.set(task_info);
                 let _ = task.poll();
             }
             SyscallNbCompResult::Multiple => {
                 println!("Recieve a multiple");
                 // Batch SQEs ou multishot kernel : toujours poller.
                 // Release uniquement sur la CQE finale (pas de F_MORE).
-                CURRENT_TASK.set(Some(task_info));
+                CURRENT_TASK.set(task_info);
                 let _ = task.poll();
             }
         }
@@ -244,19 +244,19 @@ impl Runtime {
         }
     }
     fn set_current_task_multiple(is_multiple: bool) {
-        let mut current_task = CURRENT_TASK.get().expect("appelé hors contexte runtime");
+        let mut current_task = CURRENT_TASK.get();
         if is_multiple {
             current_task.tag.syscall_nb |= 0x8000;
         } else {
             current_task.tag.syscall_nb &= !0x8000;
         }
-        CURRENT_TASK.set(Some(current_task));
+        CURRENT_TASK.set(current_task);
     }
 
     /// user_data pour la task courante. `multishot=true` pose le MULTIPLE_MASK sur syscall_nb.
     fn current_udata() -> u64 {
         CURRENT_TASK.with(|c| {
-            let info = c.get().expect("appelé hors contexte runtime");
+            let info = c.get();
 
             UserDataPayload {
                 task_idx: info.tag.task_idx,
@@ -269,7 +269,7 @@ impl Runtime {
 
     fn send_read(&mut self, fd: u32) {
         let udata = Self::current_udata();
-        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        let task_idx = CURRENT_TASK.with(|c| c.get().tag.task_idx);
 
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Read::new(
@@ -288,7 +288,7 @@ impl Runtime {
     /// `listen_fd` est le fd du socket en écoute (non-fixed).
     fn send_accept(&mut self, listen_fd: i32) {
         let udata = Self::current_udata();
-        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        let task_idx = CURRENT_TASK.with(|c| c.get().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Accept::new(
             io_uring::types::Fd(listen_fd),
@@ -304,7 +304,7 @@ impl Runtime {
     /// WRITE_FIXED : envoie `len` octets du buffer `buf_id` sur `fd` (fixed file).
     fn send_write(&mut self, fd: u32, buf_id: u16, len: u32) {
         let udata = Self::current_udata();
-        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        let task_idx = CURRENT_TASK.with(|c| c.get().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let buf_ptr = self.buffer.write_buf_ptr(buf_id);
         let sqe =
@@ -319,7 +319,7 @@ impl Runtime {
     fn send_recv_multishot(&mut self, fd: u32) {
         Self::set_current_task_multiple(true);
         let udata = Self::current_udata(); // MULTIPLE_MASK
-        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        let task_idx = CURRENT_TASK.with(|c| c.get().tag.task_idx);
         self.tasks[task_idx].set_multishot();
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::RecvMulti::new(io_uring::types::Fixed(fd), 0)
@@ -333,7 +333,7 @@ impl Runtime {
     fn send_accept_multishot(&mut self, listen_fd: i32) {
         Self::set_current_task_multiple(true);
         let udata = Self::current_udata(); // MULTIPLE_MASK
-        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        let task_idx = CURRENT_TASK.with(|c| c.get().tag.task_idx);
         self.tasks[task_idx].set_multishot();
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::AcceptMulti::new(io_uring::types::Fd(listen_fd))
@@ -348,7 +348,7 @@ impl Runtime {
     fn send_commit_write(&mut self, ptr: *const u8, fd_idx: u32, len: u32, buf_id: u16) {
         Self::set_current_task_multiple(true);
         let udata = Self::current_udata(); // MULTIPLE_MASK
-        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        let task_idx = CURRENT_TASK.with(|c| c.get().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let sqe =
             io_uring::opcode::WriteFixed::new(io_uring::types::Fixed(fd_idx), ptr, len, buf_id)
@@ -385,7 +385,7 @@ impl Runtime {
     /// `addr` doit rester valide jusqu'à la CQE — la future doit la stocker inline.
     fn send_connect(&mut self, fd: u32, addr: *const libc::sockaddr, addrlen: libc::socklen_t) {
         let udata = Self::current_udata();
-        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        let task_idx = CURRENT_TASK.with(|c| c.get().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Connect::new(io_uring::types::Fixed(fd), addr, addrlen)
             .build()
@@ -396,7 +396,7 @@ impl Runtime {
     /// SOCKET : crée un socket TCP (SOCK_STREAM) et l'installe dans un slot fixed-file auto.
     fn send_socket(&mut self) {
         let udata = Self::current_udata();
-        let task_idx = CURRENT_TASK.with(|c| c.get().unwrap().tag.task_idx);
+        let task_idx = CURRENT_TASK.with(|c| c.get().tag.task_idx);
         self.tasks[task_idx].inc_rc();
         let sqe = io_uring::opcode::Socket::new(
             libc::AF_INET,
@@ -409,7 +409,7 @@ impl Runtime {
         self.pending.push(sqe);
     }
     fn send_multiple_write(&mut self, fds: &[u32], buffer: WBuffer<1>, len: u32) {
-        let task_info = CURRENT_TASK.get().expect("get current task failed");
+        let task_info = CURRENT_TASK.get();
         let mut user_data: UserDataPayload = (&task_info).into();
 
         for (idx, &fd) in fds.into_iter().enumerate() {
@@ -494,25 +494,17 @@ pub fn alloc_write_buffer() -> WBuffer<1> {
 }
 
 pub(crate) fn current_result() -> i32 {
-    CURRENT_TASK.with(|c| {
-        c.get()
-            .expect("current_result hors contexte runtime")
-            .result
-    })
+    CURRENT_TASK.with(|c| c.get().result)
 }
 pub(crate) fn current_cqe_flags() -> u32 {
-    CURRENT_TASK.with(|c| {
-        c.get()
-            .expect("current_cqe_flags hors contexte runtime")
-            .flags
-    })
+    CURRENT_TASK.with(|c| c.get().flags)
 }
 pub fn spawn(future: impl Future<Output = ()>) {
     let (mut task, old_context) = GLOBAL_RUNTIME.with_borrow_mut(|rt| {
         let task = Task::new(future);
         let task_idx = rt.tasks.insert(task.clone());
         let old_task_context = CURRENT_TASK.get();
-        CURRENT_TASK.set(Some(TaskInfo::initial_poll(task_idx)));
+        CURRENT_TASK.set(TaskInfo::initial_poll(task_idx));
         (task, old_task_context)
     });
 
@@ -540,6 +532,59 @@ pub struct TaskInfo {
     pub(crate) flags: u32,
     pub(crate) response_gen: u16,
 }
+
+impl TaskInfo {
+    fn dummy() -> Self {
+        let tag = Tag::new(SlabIdx::dummy());
+        Self {
+            tag,
+            result: i32::MIN,
+            flags: u32::MAX,
+            response_gen: u16::MAX,
+        }
+    }
+    pub(crate) fn set_to_next_task(&mut self) {
+        self.result = i32::MIN;
+        self.response_gen = 0;
+        self.flags = 0;
+        self.tag.augmente_syscall_nb();
+    }
+    fn initial_poll(task_idx: SlabIdx) -> Self {
+        Self {
+            tag: Tag::new(task_idx),
+            result: i32::MAX,
+            flags: 0,
+            response_gen: u16::MAX,
+        }
+    }
+    fn from_entry(entry: &io_uring::cqueue::Entry) -> Self {
+        let payload = UserDataPayload::from_entry(entry);
+        let tag = Tag {
+            syscall_nb: payload.syscall_nb,
+            task_idx: payload.task_idx,
+        };
+        Self {
+            tag,
+            result: entry.result(),
+            flags: entry.flags(),
+            response_gen: payload.response_gen,
+        }
+    }
+    fn from_waker(waker: Waker) -> Self {
+        let res = Self {
+            tag: Tag {
+                task_idx: waker.payload.task_idx,
+                syscall_nb: waker.payload.response_gen,
+            },
+            result: i32::MIN,
+            flags: u32::MAX,
+            response_gen: waker.payload.response_gen,
+        };
+        std::mem::forget(waker);
+        res
+    }
+}
+
 impl Into<UserDataPayload> for &TaskInfo {
     fn into(self) -> UserDataPayload {
         UserDataPayload {
@@ -578,49 +623,15 @@ impl UserDataPayload {
     }
 }
 
-impl TaskInfo {
-    fn initial_poll(task_idx: SlabIdx) -> Self {
-        Self {
-            tag: Tag::new(task_idx),
-            result: i32::MAX,
-            flags: 0,
-            response_gen: u16::MAX,
-        }
-    }
-    fn from_entry(entry: &io_uring::cqueue::Entry) -> Self {
-        let payload = UserDataPayload::from_entry(entry);
-        let tag = Tag {
-            syscall_nb: payload.syscall_nb,
-            task_idx: payload.task_idx,
-        };
-        Self {
-            tag,
-            result: entry.result(),
-            flags: entry.flags(),
-            response_gen: payload.response_gen,
-        }
-    }
-    fn from_waker(waker: Waker) -> Self {
-        let res = Self {
-            tag: Tag {
-                task_idx: waker.payload.task_idx,
-                syscall_nb: waker.payload.response_gen,
-            },
-            result: i32::MIN,
-            flags: u32::MAX,
-            response_gen: waker.payload.response_gen,
-        };
-        std::mem::forget(waker);
-        res
-    }
-}
-
 impl Tag {
     fn new(task_idx: SlabIdx) -> Self {
         Self {
             task_idx,
             syscall_nb: 0,
         }
+    }
+    fn augmente_syscall_nb(&mut self) {
+        self.syscall_nb = ((self.syscall_nb & (!MULTIPLE_MASK)) + 1) % MULTIPLE_MASK;
     }
 }
 
